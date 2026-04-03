@@ -20,5 +20,3 @@ build/
 *.log
 *.sqlite3
 *.db
-caminesproyecto.json
-firebase-credentials.json
