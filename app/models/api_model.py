@@ -52,6 +52,7 @@ class PuntoControlCreate(BaseModel):
     id_esp32: str
     id_zona: str | None = None
     ubicacion: str | None = None
+    cordenadas: str | None = None
 
 
 class PuntoControlUpdate(BaseModel):
@@ -59,7 +60,33 @@ class PuntoControlUpdate(BaseModel):
     tipo_punto: str | None = None
     id_zona: str | None = None
     ubicacion: str | None = None
+    cordenadas: str | None = None
     activo: bool | None = None
+
+
+class RutaPunto(BaseModel):
+    id_punto_control: str
+    orden: int
+
+
+class RutaCreate(BaseModel):
+    nombre: str
+    descripcion: str | None = None
+    activa: bool = True
+    puntos: list[RutaPunto] = []
+
+
+class RutaUpdate(BaseModel):
+    nombre: str | None = None
+    descripcion: str | None = None
+    activa: bool | None = None
+    puntos: list[RutaPunto] | None = None
+
+
+class RutaCamionAsignacionCreate(BaseModel):
+    id_ruta: str
+    id_camion: str
+    hora_inicio: datetime
 
 
 class DashboardSummary(BaseModel):

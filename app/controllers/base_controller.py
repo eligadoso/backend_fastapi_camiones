@@ -193,6 +193,7 @@ class WebhookController:
                 "tipo_punto": "checkpoint",
                 "id_esp32": esp32_id,
                 "ubicacion": None,
+                "cordenadas": None,
                 "activo": True,
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }
