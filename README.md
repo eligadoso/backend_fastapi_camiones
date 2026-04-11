@@ -30,6 +30,8 @@ uvicorn app.main:app --reload
 python scripts/test_firebase_connection.py --credentials-path caminesproyecto.json
 ```
 
+Ese script además crea el usuario inicial `admin / admin123` si todavía no existe en la colección `usuario`.
+
 También puedes usar las variables de `.env`:
 
 - `FIREBASE_CREDENTIALS_PATH`

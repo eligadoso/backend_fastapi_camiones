@@ -224,13 +224,15 @@ class WebhookController:
         )
         return point_id
 
-    def _register_movimiento_desde_lectura(
-        self,
-        id_tag: str,
-        id_punto_control: str,
-        id_lectura: str,
-        timestamp: str,
-    ) -> None:
+    def _resolve_camion_conductor_para_tag(self, id_tag: str) -> tuple[str | None, str | None]:
+        """Devuelve (id_camion, id_conductor) para el tag dado.
+
+        Prioridad:
+        1. vinculacion_activa (vínculo operacional explícito)
+        2. asignacion_tag   (asignación estática alternativa)
+        3. tag_rfid.id_conductor → conductor.id_camion  (cadena principal de la UI)
+        """
+        # 1) Vínculo operacional explícito
         vinculos = list(
             self._where_eq(
                 self._where_eq(self._db.collection("vinculacion_activa"), "id_tag", id_tag),
@@ -240,18 +242,73 @@ class WebhookController:
             .limit(1)
             .stream()
         )
-        if not vinculos:
+        if vinculos:
+            v = vinculos[0].to_dict()
+            return v.get("id_camion"), v.get("id_conductor")
+
+        # 2) asignacion_tag (alternativa explícita)
+        asignaciones = list(
+            self._where_eq(
+                self._where_eq(self._db.collection("asignacion_tag"), "id_tag", id_tag),
+                "activa",
+                True,
+            )
+            .limit(1)
+            .stream()
+        )
+        if asignaciones:
+            id_camion = asignaciones[0].to_dict().get("id_camion")
+            if id_camion:
+                camion_snap = self._db.collection("camion").document(id_camion).get()
+                id_conductor = camion_snap.to_dict().get("id_conductor") if camion_snap.exists else None
+                if not id_conductor:
+                    conds = list(
+                        self._where_eq(self._db.collection("conductor"), "id_camion", id_camion).limit(1).stream()
+                    )
+                    if conds:
+                        id_conductor = conds[0].to_dict().get("id_conductor")
+                return id_camion, id_conductor
+
+        # 3) Cadena principal creada por la UI:
+        #    tag_rfid.id_conductor  →  conductor.id_camion
+        tag_snap = self._db.collection("tag_rfid").document(id_tag).get()
+        if not tag_snap.exists:
+            return None, None
+        id_conductor = tag_snap.to_dict().get("id_conductor")
+        if not id_conductor:
+            return None, None
+
+        conductor_snap = self._db.collection("conductor").document(id_conductor).get()
+        if not conductor_snap.exists:
+            return None, id_conductor
+        id_camion = conductor_snap.to_dict().get("id_camion")
+
+        if not id_camion:
+            # Búsqueda inversa por si el campo está solo en el camión
+            camiones = list(
+                self._where_eq(self._db.collection("camion"), "id_conductor", id_conductor).limit(1).stream()
+            )
+            if camiones:
+                id_camion = camiones[0].to_dict().get("id_camion")
+
+        return id_camion, id_conductor
+
+    def _register_movimiento_desde_lectura(
+        self,
+        id_tag: str,
+        id_punto_control: str,
+        id_lectura: str,
+        timestamp: str,
+    ) -> None:
+        id_camion, id_conductor = self._resolve_camion_conductor_para_tag(id_tag)
+        if not id_camion or not id_conductor:
+            print(f"[ThingSpeak] Sin asignación activa para tag={id_tag}, movimiento no registrado")
             return
-        vinculo = vinculos[0].to_dict()
         punto_snap = self._db.collection("punto_control").document(id_punto_control).get()
         if not punto_snap.exists:
             return
         punto = punto_snap.to_dict()
         tipo_punto = punto.get("tipo_punto", "checkpoint")
-        id_camion = vinculo.get("id_camion")
-        id_conductor = vinculo.get("id_conductor")
-        if not id_camion or not id_conductor:
-            return
         visitas_ref = self._db.collection("visita")
         abiertas = list(
             self._where_eq(self._where_eq(visitas_ref, "id_camion", id_camion), "estado_visita", "en_planta")

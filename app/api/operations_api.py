@@ -218,6 +218,48 @@ def _clear_camion_conductor_assignment(db, id_camion: str | None = None, id_cond
         )
 
 
+def _load_tag_a_camion(db) -> dict[str, str]:
+    """Devuelve un mapa {id_tag -> id_camion} desde todas las fuentes de asignación.
+
+    Prioridad:
+    1. vinculacion_activa (vínculo operacional explícito)
+    2. asignacion_tag    (asignación estática alternativa)
+    3. tag_rfid.id_conductor → conductor.id_camion  (cadena principal de la UI)
+    """
+    result: dict[str, str] = {}
+
+    # 1) vinculacion_activa
+    for doc in db.collection("vinculacion_activa").stream():
+        data = doc.to_dict()
+        if data.get("activa") and data.get("id_tag") and data.get("id_camion"):
+            result[data["id_tag"]] = data["id_camion"]
+
+    # 2) asignacion_tag
+    for doc in db.collection("asignacion_tag").stream():
+        data = doc.to_dict()
+        if data.get("activa") and data.get("id_tag") and data.get("id_camion"):
+            result.setdefault(data["id_tag"], data["id_camion"])
+
+    # 3) Cadena principal de la UI: tag_rfid.id_conductor → conductor.id_camion
+    conductores_by_id = {
+        doc.to_dict().get("id_conductor"): doc.to_dict()
+        for doc in db.collection("conductor").stream()
+        if doc.to_dict().get("id_conductor")
+    }
+    for doc in db.collection("tag_rfid").stream():
+        data = doc.to_dict()
+        id_tag = data.get("id_tag")
+        id_conductor = data.get("id_conductor")
+        if not id_tag or not id_conductor or id_tag in result:
+            continue
+        conductor = conductores_by_id.get(id_conductor, {})
+        id_camion = conductor.get("id_camion")
+        if id_camion:
+            result[id_tag] = id_camion
+
+    return result
+
+
 def _load_movimientos_por_camion(db) -> dict[str, list[dict]]:
     visitas_by_id = {
         doc.to_dict().get("id_visita"): doc.to_dict()
@@ -225,6 +267,8 @@ def _load_movimientos_por_camion(db) -> dict[str, list[dict]]:
         if doc.to_dict().get("id_visita")
     }
     movimientos_por_camion: dict[str, list[dict]] = {}
+
+    # Fuente primaria: movimiento_acceso (datos normales / futuros)
     for doc in db.collection("movimiento_acceso").stream():
         mov = doc.to_dict()
         visita = visitas_by_id.get(mov.get("id_visita"))
@@ -235,6 +279,40 @@ def _load_movimientos_por_camion(db) -> dict[str, list[dict]]:
         if not id_camion or timestamp is None:
             continue
         movimientos_por_camion.setdefault(id_camion, []).append({**mov, "_dt": timestamp})
+
+    # Fuente de respaldo: lectura_rfid (cubre lecturas históricas sin movimiento_acceso)
+    # Solo se usa cuando no hay ya un movimiento_acceso para esa lectura.
+    lecturas_ya_en_movimiento = {
+        mov.get("id_lectura")
+        for movs in movimientos_por_camion.values()
+        for mov in movs
+        if mov.get("id_lectura")
+    }
+    tag_a_camion = _load_tag_a_camion(db)
+    for doc in db.collection("lectura_rfid").stream():
+        lectura = doc.to_dict()
+        id_lectura = lectura.get("id_lectura")
+        if id_lectura in lecturas_ya_en_movimiento:
+            continue
+        id_tag = lectura.get("id_tag")
+        id_camion = tag_a_camion.get(id_tag)
+        if not id_camion:
+            continue
+        timestamp = _parse_iso_datetime(lectura.get("fecha_hora_lectura"))
+        if timestamp is None:
+            continue
+        mov_sintetico = {
+            "id_movimiento": None,
+            "id_visita": None,
+            "id_lectura": id_lectura,
+            "id_punto_control": lectura.get("id_punto_control"),
+            "tipo_movimiento": "paso_punto",
+            "fecha_hora_movimiento": lectura.get("fecha_hora_lectura"),
+            "_dt": timestamp,
+            "_sintetico": True,
+        }
+        movimientos_por_camion.setdefault(id_camion, []).append(mov_sintetico)
+
     for id_camion in movimientos_por_camion:
         movimientos_por_camion[id_camion].sort(key=lambda item: item["_dt"])
     return movimientos_por_camion
@@ -761,8 +839,8 @@ def delete_ruta(id_ruta: str, user: dict = Depends(get_current_user)) -> dict:
 @router.post("/seguimiento-rutas/asignaciones")
 def create_ruta_asignacion(payload: RutaCamionAsignacionCreate, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
-    ruta = db.collection("ruta").document(payload.id_ruta).get()
-    if not ruta.exists:
+    ruta_snap = db.collection("ruta").document(payload.id_ruta).get()
+    if not ruta_snap.exists:
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
     camion = db.collection("camion").document(payload.id_camion).get()
     if not camion.exists:
@@ -773,6 +851,12 @@ def create_ruta_asignacion(payload: RutaCamionAsignacionCreate, user: dict = Dep
     for doc in active:
         doc.reference.update({"activa": False, "fecha_fin": now})
     id_asignacion_ruta = uuid4().hex
+    # Snapshot de los puntos de la ruta en el momento de creación del recorrido.
+    # Esto garantiza que modificar la ruta NO afecta recorridos ya registrados.
+    puntos_snapshot = sorted(
+        ruta_snap.to_dict().get("puntos", []),
+        key=lambda x: x.get("orden", 0),
+    )
     record = {
         "id_asignacion_ruta": id_asignacion_ruta,
         "id_ruta": payload.id_ruta,
@@ -780,6 +864,7 @@ def create_ruta_asignacion(payload: RutaCamionAsignacionCreate, user: dict = Dep
         "hora_inicio": payload.hora_inicio.astimezone(timezone.utc).isoformat(),
         "activa": True,
         "fecha_fin": None,
+        "puntos_snapshot": puntos_snapshot,
         "created_at": now,
     }
     ref.document(id_asignacion_ruta).set(record)
@@ -797,9 +882,21 @@ def list_ruta_asignaciones(id_ruta: str | None = None, user: dict = Depends(get_
         doc.to_dict().get("id_camion"): doc.to_dict()
         for doc in db.collection("camion").stream()
     }
+    conductores = {
+        doc.to_dict().get("id_conductor"): doc.to_dict()
+        for doc in db.collection("conductor").stream()
+    }
     for item in items:
         camion = camiones.get(item.get("id_camion"), {})
         item["patente"] = camion.get("patente")
+        # Enriquecer con conductor asignado al camión al momento del recorrido
+        id_conductor = camion.get("id_conductor")
+        conductor = conductores.get(id_conductor, {}) if id_conductor else {}
+        item["conductor_nombre"] = (
+            f"{conductor.get('nombre', '')} {conductor.get('apellido', '')}".strip()
+            if conductor else None
+        )
+        item["id_conductor"] = id_conductor
     return {"status": "ok", "data": items}
 
 
@@ -814,8 +911,6 @@ def get_seguimiento_ruta(
     ruta_snap = db.collection("ruta").document(id_ruta).get()
     if not ruta_snap.exists:
         raise HTTPException(status_code=404, detail="Ruta no encontrada")
-    ruta = ruta_snap.to_dict()
-    puntos_ruta = sorted(ruta.get("puntos", []), key=lambda x: x.get("orden", 0))
     puntos_lookup = {
         doc.to_dict().get("id_punto_control"): doc.to_dict()
         for doc in db.collection("punto_control").stream()
@@ -840,6 +935,15 @@ def get_seguimiento_ruta(
             raise HTTPException(status_code=404, detail="Recorrido no encontrado")
     else:
         asignacion = next((item for item in asignaciones if item.get("activa")), asignaciones[0])
+
+    # Usar el snapshot de puntos guardado al crear el recorrido (req: cambios en la ruta
+    # no afectan recorridos ya registrados). Si no existe snapshot (recorridos antiguos),
+    # se cae de respaldo a los puntos actuales de la ruta.
+    puntos_ruta = sorted(
+        asignacion.get("puntos_snapshot") or ruta_snap.to_dict().get("puntos", []),
+        key=lambda x: x.get("orden", 0),
+    )
+
     hora_inicio = _parse_iso_datetime(asignacion.get("hora_inicio"))
     if hora_inicio is None:
         return {"status": "ok", "data": {"id_ruta": id_ruta, "id_camion": id_camion, "puntos": []}}
@@ -892,6 +996,8 @@ def get_seguimiento_ruta(
             }
         )
     salida.sort(key=lambda x: x["orden"])
+
+    # Detectar si aún hay puntos pendientes para la lógica de "en_punto"
     if salida:
         pendientes = [item for item in salida if item["estado"] == "pendiente"]
         if pendientes:
@@ -908,6 +1014,25 @@ def get_seguimiento_ruta(
                     mins = minutes % 60
                     actual["tiempo_en_punto"] = f"{hours:02d}:{mins:02d}"
                     actual["referencia_tiempo_en_punto"] = previo_dt.isoformat()
+
+    # Auto-completar el recorrido cuando todos los puntos fueron visitados
+    auto_completado = False
+    todos_pasados = salida and all(p["estado"] in ("pasado", "omitido") for p in salida)
+    if todos_pasados and asignacion.get("activa"):
+        ultimo_paso = max(
+            (_parse_iso_datetime(p["fecha_hora_paso"]) for p in salida if p.get("fecha_hora_paso")),
+            default=now,
+        )
+        db.collection("ruta_camion_asignacion").document(
+            asignacion["id_asignacion_ruta"]
+        ).update({
+            "activa": False,
+            "fecha_fin": ultimo_paso.isoformat(),
+            "updated_at": now.isoformat(),
+        })
+        hora_fin = ultimo_paso
+        auto_completado = True
+
     return {
         "status": "ok",
         "data": {
@@ -916,6 +1041,8 @@ def get_seguimiento_ruta(
             "id_asignacion_ruta": asignacion.get("id_asignacion_ruta"),
             "hora_inicio": hora_inicio.isoformat(),
             "fecha_fin": hora_fin.isoformat() if hora_fin else None,
+            "activa": False if auto_completado else asignacion.get("activa", False),
+            "auto_completado": auto_completado,
             "puntos": salida,
         },
     }
