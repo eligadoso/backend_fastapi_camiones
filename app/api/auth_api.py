@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from app.api.dependencies import get_current_user
 from app.firebase_client import get_firestore_client
@@ -11,7 +12,12 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 @router.post("/login")
 def login(payload: LoginRequest, request: Request) -> dict:
     db = get_firestore_client()
-    users = list(db.collection("usuario").where("username", "==", payload.username).limit(1).stream())
+    users = list(
+        db.collection("usuario")
+        .where(filter=FieldFilter("username", "==", payload.username))
+        .limit(1)
+        .stream()
+    )
     if not users:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Credenciales inválidas")
     user = users[0].to_dict()

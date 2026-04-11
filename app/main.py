@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from google.cloud.firestore_v1.base_query import FieldFilter
 from starlette.middleware.sessions import SessionMiddleware
 from uuid import uuid4
 
@@ -27,7 +28,7 @@ def ensure_admin_user() -> None:
     try:
         db = get_firestore_client()
         users = db.collection("usuario")
-        exists = list(users.where("username", "==", "admin").limit(1).stream())
+        exists = list(users.where(filter=FieldFilter("username", "==", "admin")).limit(1).stream())
         if exists:
             return
         doc_id = uuid4().hex

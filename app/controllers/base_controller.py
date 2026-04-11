@@ -4,6 +4,7 @@ from typing import Any
 from uuid import uuid4
 
 import httpx
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from app.firebase_client import get_firestore_client
 from app.models import SensorReading, ThingSpeakWebhookPayload
@@ -13,13 +14,36 @@ from app.settings import settings
 class WebhookController:
     def __init__(self) -> None:
         self._db = self._build_firestore_client()
-        self._last_entry_id: int | None = None
+        self._last_entry_id: int | None = self._load_last_entry_id()
 
     def _build_firestore_client(self):
         try:
             return get_firestore_client()
         except Exception:
             return None
+
+    def _load_last_entry_id(self) -> int | None:
+        if self._db is None:
+            return None
+        try:
+            docs = (
+                self._db.collection(settings.firebase_collection)
+                .order_by("received_at", direction="DESCENDING")
+                .limit(1)
+                .stream()
+            )
+            for doc in docs:
+                data = doc.to_dict()
+                raw = data.get("raw_payload", {})
+                entry_id = raw.get("entry_id")
+                if entry_id is not None:
+                    return int(entry_id)
+        except Exception:
+            pass
+        return None
+
+    def _where_eq(self, query, field: str, value):
+        return query.where(filter=FieldFilter(field, "==", value))
 
     async def pull_latest_from_thingspeak(self, channel_id: str) -> dict[str, Any]:
         url, params = self._build_thingspeak_request(channel_id=channel_id)
@@ -163,7 +187,7 @@ class WebhookController:
         )
 
     def _ensure_tag(self, uid: str) -> str:
-        tags = list(self._db.collection("tag_rfid").where("uid_tag", "==", uid).limit(1).stream())
+        tags = list(self._where_eq(self._db.collection("tag_rfid"), "uid_tag", uid).limit(1).stream())
         if tags:
             return tags[0].to_dict()["id_tag"]
         tag_id = uuid4().hex
@@ -181,7 +205,7 @@ class WebhookController:
         return tag_id
 
     def _ensure_punto_control(self, esp32_id: str) -> str:
-        points = list(self._db.collection("punto_control").where("id_esp32", "==", esp32_id).limit(1).stream())
+        points = list(self._where_eq(self._db.collection("punto_control"), "id_esp32", esp32_id).limit(1).stream())
         if points:
             return points[0].to_dict()["id_punto_control"]
         point_id = uuid4().hex
@@ -208,9 +232,11 @@ class WebhookController:
         timestamp: str,
     ) -> None:
         vinculos = list(
-            self._db.collection("vinculacion_activa")
-            .where("id_tag", "==", id_tag)
-            .where("activa", "==", True)
+            self._where_eq(
+                self._where_eq(self._db.collection("vinculacion_activa"), "id_tag", id_tag),
+                "activa",
+                True,
+            )
             .limit(1)
             .stream()
         )
@@ -228,7 +254,9 @@ class WebhookController:
             return
         visitas_ref = self._db.collection("visita")
         abiertas = list(
-            visitas_ref.where("id_camion", "==", id_camion).where("estado_visita", "==", "en_planta").limit(1).stream()
+            self._where_eq(self._where_eq(visitas_ref, "id_camion", id_camion), "estado_visita", "en_planta")
+            .limit(1)
+            .stream()
         )
         visita_id = None
         if tipo_punto == "porton_entrada":

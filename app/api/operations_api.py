@@ -2,13 +2,16 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from google.cloud.firestore_v1.base_query import FieldFilter
 
 from app.api.dependencies import get_current_user
 from app.firebase_client import get_firestore_client
 from app.models.api_model import (
     AsignacionTagCreate,
     CamionCreate,
+    CamionUpdate,
     ConductorCreate,
+    ConductorUpdate,
     DashboardMovimiento,
     DashboardSummary,
     PuntoControlCreate,
@@ -16,8 +19,11 @@ from app.models.api_model import (
     RutaCamionAsignacionCreate,
     RutaCreate,
     RutaUpdate,
+    TagConductorAsignacion,
     TagCreate,
     TagUpdate,
+    TipoPuntoCreate,
+    TipoPuntoUpdate,
     VinculacionCreate,
 )
 
@@ -30,11 +36,15 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
+def _where_eq(query, field: str, value):
+    return query.where(filter=FieldFilter(field, "==", value))
+
+
 @router.post("/camiones")
 def create_camion(payload: CamionCreate, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     camion_ref = db.collection("camion")
-    exists = list(camion_ref.where("patente", "==", payload.patente).limit(1).stream())
+    exists = list(_where_eq(camion_ref, "patente", payload.patente).limit(1).stream())
     if exists:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Patente ya registrada")
     id_camion = uuid4().hex
@@ -70,11 +80,40 @@ def get_camion(id_camion: str, user: dict = Depends(get_current_user)) -> dict:
     return {"status": "ok", "data": snap.to_dict()}
 
 
+@router.put("/camiones/{id_camion}")
+def update_camion(id_camion: str, payload: CamionUpdate, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    ref = db.collection("camion").document(id_camion)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Camión no encontrado")
+    current = snap.to_dict()
+    update_data: dict = {}
+    for field in ("patente", "marca", "modelo", "color", "estado"):
+        val = getattr(payload, field)
+        if val is not None:
+            update_data[field] = val
+    if update_data:
+        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        ref.update(update_data)
+    return {"status": "ok", "data": {**current, **update_data}}
+
+
+@router.delete("/camiones/{id_camion}")
+def delete_camion(id_camion: str, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    ref = db.collection("camion").document(id_camion)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Camión no encontrado")
+    ref.delete()
+    return {"status": "ok"}
+
+
 @router.post("/conductores")
 def create_conductor(payload: ConductorCreate, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     ref = db.collection("conductor")
-    exists = list(ref.where("rut", "==", payload.rut).limit(1).stream())
+    exists = list(_where_eq(ref, "rut", payload.rut).limit(1).stream())
     if exists:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="RUT ya registrado")
     id_conductor = uuid4().hex
@@ -98,14 +137,52 @@ def list_conductores(user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     data = [doc.to_dict() for doc in db.collection("conductor").stream()]
     data.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    # Enrich with tag info (find tag where id_conductor == this conductor)
+    tags_by_conductor: dict[str, dict] = {}
+    for tag_doc in db.collection("tag_rfid").stream():
+        tag = tag_doc.to_dict()
+        id_c = tag.get("id_conductor")
+        if id_c:
+            tags_by_conductor[id_c] = tag
+    for conductor in data:
+        conductor["tag"] = tags_by_conductor.get(conductor["id_conductor"])
     return {"status": "ok", "data": data}
+
+
+@router.put("/conductores/{id_conductor}")
+def update_conductor(id_conductor: str, payload: ConductorUpdate, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    ref = db.collection("conductor").document(id_conductor)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Conductor no encontrado")
+    current = snap.to_dict()
+    update_data: dict = {}
+    for field in ("nombre", "apellido", "telefono", "licencia", "estado"):
+        val = getattr(payload, field)
+        if val is not None:
+            update_data[field] = val
+    if update_data:
+        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        ref.update(update_data)
+    return {"status": "ok", "data": {**current, **update_data}}
+
+
+@router.delete("/conductores/{id_conductor}")
+def delete_conductor(id_conductor: str, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    ref = db.collection("conductor").document(id_conductor)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Conductor no encontrado")
+    ref.delete()
+    return {"status": "ok"}
 
 
 @router.post("/rfid/tags")
 def create_tag(payload: TagCreate, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     ref = db.collection("tag_rfid")
-    exists = list(ref.where("uid_tag", "==", payload.uid_tag).limit(1).stream())
+    exists = list(_where_eq(ref, "uid_tag", payload.uid_tag).limit(1).stream())
     if exists:
         return {"status": "ok", "data": exists[0].to_dict()}
     id_tag = uuid4().hex
@@ -127,6 +204,11 @@ def list_tags(user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     data = [doc.to_dict() for doc in db.collection("tag_rfid").stream()]
     data.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    # Enrich with conductor info
+    conductores = {doc.id: doc.to_dict() for doc in db.collection("conductor").stream()}
+    for tag in data:
+        id_c = tag.get("id_conductor")
+        tag["conductor"] = conductores.get(id_c) if id_c else None
     return {"status": "ok", "data": data}
 
 
@@ -152,11 +234,58 @@ def update_tag(id_tag: str, payload: TagUpdate, user: dict = Depends(get_current
     return {"status": "ok", "data": merged}
 
 
+@router.delete("/rfid/tags/{id_tag}")
+def delete_tag(id_tag: str, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    ref = db.collection("tag_rfid").document(id_tag)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Tag no encontrado")
+    ref.delete()
+    return {"status": "ok"}
+
+
+@router.put("/rfid/tags/{id_tag}/asignar-conductor")
+def asignar_conductor_a_tag(
+    id_tag: str, payload: TagConductorAsignacion, user: dict = Depends(get_current_user)
+) -> dict:
+    """Assigns a conductor to a tag (one-to-one). Raises 409 if either already has an assignment."""
+    db = get_firestore_client()
+    tag_ref = db.collection("tag_rfid").document(id_tag)
+    tag_snap = tag_ref.get()
+    if not tag_snap.exists:
+        raise HTTPException(status_code=404, detail="Tag no encontrado")
+    tag_data = tag_snap.to_dict()
+
+    if tag_data.get("id_conductor") and tag_data["id_conductor"] != payload.id_conductor:
+        raise HTTPException(status_code=409, detail="El tag ya tiene un conductor asignado")
+
+    # Check no other tag already has this conductor
+    existing = list(
+        _where_eq(db.collection("tag_rfid"), "id_conductor", payload.id_conductor).limit(1).stream()
+    )
+    if existing and existing[0].id != id_tag:
+        raise HTTPException(status_code=409, detail="El conductor ya tiene un tag asignado")
+
+    tag_ref.update({"id_conductor": payload.id_conductor, "updated_at": datetime.now(timezone.utc).isoformat()})
+    return {"status": "ok"}
+
+
+@router.delete("/rfid/tags/{id_tag}/asignar-conductor")
+def desasignar_conductor_de_tag(id_tag: str, user: dict = Depends(get_current_user)) -> dict:
+    """Removes the conductor assignment from a tag."""
+    db = get_firestore_client()
+    ref = db.collection("tag_rfid").document(id_tag)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Tag no encontrado")
+    ref.update({"id_conductor": None, "updated_at": datetime.now(timezone.utc).isoformat()})
+    return {"status": "ok"}
+
+
 @router.post("/puntos-control")
 def create_punto_control(payload: PuntoControlCreate, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     ref = db.collection("punto_control")
-    exists = list(ref.where("id_esp32", "==", payload.id_esp32).limit(1).stream())
+    exists = list(_where_eq(ref, "id_esp32", payload.id_esp32).limit(1).stream())
     if exists:
         return {"status": "ok", "data": exists[0].to_dict()}
     id_punto_control = uuid4().hex
@@ -315,9 +444,7 @@ def create_ruta_asignacion(payload: RutaCamionAsignacionCreate, user: dict = Dep
         raise HTTPException(status_code=404, detail="Camión no encontrado")
     ref = db.collection("ruta_camion_asignacion")
     now = datetime.now(timezone.utc).isoformat()
-    active = list(
-        ref.where("id_camion", "==", payload.id_camion).where("activa", "==", True).stream()
-    )
+    active = list(_where_eq(_where_eq(ref, "id_camion", payload.id_camion), "activa", True).stream())
     for doc in active:
         doc.reference.update({"activa": False, "fecha_fin": now})
     id_asignacion_ruta = uuid4().hex
@@ -369,10 +496,11 @@ def get_seguimiento_ruta(
     }
     asignaciones = [
         doc.to_dict()
-        for doc in db.collection("ruta_camion_asignacion")
-        .where("id_ruta", "==", id_ruta)
-        .where("id_camion", "==", id_camion)
-        .stream()
+        for doc in _where_eq(
+            _where_eq(db.collection("ruta_camion_asignacion"), "id_ruta", id_ruta),
+            "id_camion",
+            id_camion,
+        ).stream()
     ]
     if not asignaciones:
         return {"status": "ok", "data": {"id_ruta": id_ruta, "id_camion": id_camion, "puntos": []}}
@@ -382,7 +510,7 @@ def get_seguimiento_ruta(
     if hora_inicio is None:
         return {"status": "ok", "data": {"id_ruta": id_ruta, "id_camion": id_camion, "puntos": []}}
     movimientos = [doc.to_dict() for doc in db.collection("movimiento_acceso").stream()]
-    visitas = [doc.to_dict() for doc in db.collection("visita").where("id_camion", "==", id_camion).stream()]
+    visitas = [doc.to_dict() for doc in _where_eq(db.collection("visita"), "id_camion", id_camion).stream()]
     ids_visita = {v.get("id_visita") for v in visitas}
     movs_camion = []
     for mov in movimientos:
@@ -493,9 +621,7 @@ def get_metricas_rutas(id_ruta: str, user: dict = Depends(get_current_user)) -> 
     movimientos = [doc.to_dict() for doc in db.collection("movimiento_acceso").stream()]
     asignaciones = [
         doc.to_dict()
-        for doc in db.collection("ruta_camion_asignacion")
-        .where("id_ruta", "==", id_ruta)
-        .stream()
+        for doc in _where_eq(db.collection("ruta_camion_asignacion"), "id_ruta", id_ruta).stream()
     ]
     puntos_metricas = []
     for index in range(1, len(puntos_ruta)):
@@ -579,7 +705,7 @@ def list_lecturas_rfid(user: dict = Depends(get_current_user)) -> dict:
 def create_vinculacion(payload: VinculacionCreate, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     active_ref = db.collection("vinculacion_activa")
-    active_docs = list(active_ref.where("activa", "==", True).stream())
+    active_docs = list(_where_eq(active_ref, "activa", True).stream())
     now = datetime.now(timezone.utc).isoformat()
     for doc in active_docs:
         item = doc.to_dict()
@@ -654,7 +780,7 @@ def assign_tag(payload: AsignacionTagCreate, user: dict = Depends(get_current_us
     db = get_firestore_client()
     ref = db.collection("asignacion_tag")
     active_assignment = list(
-        ref.where("id_tag", "==", payload.id_tag).where("activa", "==", True).limit(1).stream()
+        _where_eq(_where_eq(ref, "id_tag", payload.id_tag), "activa", True).limit(1).stream()
     )
     if active_assignment:
         active_doc = active_assignment[0]
@@ -709,6 +835,67 @@ def dashboard_summary(user: dict = Depends(get_current_user)) -> DashboardSummar
         ingresos_hoy=ingresos_hoy,
         tiempo_promedio_estadia_min=promedio,
     )
+
+
+@router.get("/tipos-punto-control")
+def list_tipos_punto_control(user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    data = [doc.to_dict() for doc in db.collection("tipo_punto_control").stream()]
+    if not data:
+        # Seed defaults on first request
+        defaults = [
+            {"nombre": "checkpoint", "descripcion": "Punto de control genérico"},
+            {"nombre": "porton_entrada", "descripcion": "Portón de entrada a la planta"},
+            {"nombre": "porton_salida", "descripcion": "Portón de salida de la planta"},
+        ]
+        now = datetime.now(timezone.utc).isoformat()
+        for t in defaults:
+            id_tipo = uuid4().hex
+            record = {"id_tipo": id_tipo, "nombre": t["nombre"], "descripcion": t["descripcion"], "created_at": now}
+            db.collection("tipo_punto_control").document(id_tipo).set(record)
+            data.append(record)
+    data.sort(key=lambda x: x.get("created_at", ""))
+    return {"status": "ok", "data": data}
+
+
+@router.post("/tipos-punto-control")
+def create_tipo_punto_control(payload: TipoPuntoCreate, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    existing = list(_where_eq(db.collection("tipo_punto_control"), "nombre", payload.nombre).limit(1).stream())
+    if existing:
+        raise HTTPException(status_code=400, detail="Ya existe un tipo con ese nombre")
+    id_tipo = uuid4().hex
+    record = {"id_tipo": id_tipo, "nombre": payload.nombre, "descripcion": payload.descripcion, "created_at": datetime.now(timezone.utc).isoformat()}
+    db.collection("tipo_punto_control").document(id_tipo).set(record)
+    return {"status": "ok", "data": record}
+
+
+@router.put("/tipos-punto-control/{id_tipo}")
+def update_tipo_punto_control(id_tipo: str, payload: TipoPuntoUpdate, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    ref = db.collection("tipo_punto_control").document(id_tipo)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Tipo no encontrado")
+    update_data: dict = {}
+    if payload.nombre is not None:
+        update_data["nombre"] = payload.nombre
+    if payload.descripcion is not None:
+        update_data["descripcion"] = payload.descripcion
+    if update_data:
+        update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        ref.update(update_data)
+    return {"status": "ok", "data": {**snap.to_dict(), **update_data}}
+
+
+@router.delete("/tipos-punto-control/{id_tipo}")
+def delete_tipo_punto_control(id_tipo: str, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    ref = db.collection("tipo_punto_control").document(id_tipo)
+    if not ref.get().exists:
+        raise HTTPException(status_code=404, detail="Tipo no encontrado")
+    ref.delete()
+    return {"status": "ok"}
 
 
 @router.get("/dashboard/movimientos", response_model=list[DashboardMovimiento])

@@ -16,12 +16,28 @@ class CamionCreate(BaseModel):
     color: str | None = None
 
 
+class CamionUpdate(BaseModel):
+    patente: str | None = None
+    marca: str | None = None
+    modelo: str | None = None
+    color: str | None = None
+    estado: str | None = None
+
+
 class ConductorCreate(BaseModel):
     rut: str
     nombre: str
     apellido: str
     telefono: str | None = None
     licencia: str | None = None
+
+
+class ConductorUpdate(BaseModel):
+    nombre: str | None = None
+    apellido: str | None = None
+    telefono: str | None = None
+    licencia: str | None = None
+    estado: str | None = None
 
 
 class TagCreate(BaseModel):
@@ -33,6 +49,21 @@ class TagUpdate(BaseModel):
     codigo_interno: str | None = None
     estado: str | None = None
     fecha_baja: datetime | None = None
+    id_conductor: str | None = None
+
+
+class TagConductorAsignacion(BaseModel):
+    id_conductor: str
+
+
+class TipoPuntoCreate(BaseModel):
+    nombre: str
+    descripcion: str | None = None
+
+
+class TipoPuntoUpdate(BaseModel):
+    nombre: str | None = None
+    descripcion: str | None = None
 
 
 class AsignacionTagCreate(BaseModel):
