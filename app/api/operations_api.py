@@ -8,9 +8,11 @@ from app.api.dependencies import get_current_user
 from app.firebase_client import get_firestore_client
 from app.models.api_model import (
     AsignacionTagCreate,
+    CamionConductorAsignacion,
     CamionCreate,
     CamionUpdate,
     ConductorCreate,
+    ConductorCamionAsignacion,
     ConductorUpdate,
     DashboardMovimiento,
     DashboardSummary,
@@ -38,6 +40,222 @@ def _parse_iso_datetime(value: str | None) -> datetime | None:
 
 def _where_eq(query, field: str, value):
     return query.where(filter=FieldFilter(field, "==", value))
+
+
+def _parse_coords(value) -> dict[str, float] | None:
+    if not value:
+        return None
+    if isinstance(value, dict):
+        lat = value.get("lat", value.get("latitude"))
+        lng = value.get("lng", value.get("longitude"))
+        if lat is not None and lng is not None:
+            try:
+                return {"lat": float(lat), "lng": float(lng)}
+            except (TypeError, ValueError):
+                return None
+        return None
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            return {"lat": float(value[0]), "lng": float(value[1])}
+        except (TypeError, ValueError):
+            return None
+    parts = [part.strip() for part in str(value).split(",")]
+    if len(parts) != 2:
+        return None
+    try:
+        return {"lat": float(parts[0]), "lng": float(parts[1])}
+    except ValueError:
+        return None
+
+
+def _load_camiones(db) -> dict[str, dict]:
+    return {
+        doc.to_dict().get("id_camion"): doc.to_dict()
+        for doc in db.collection("camion").stream()
+        if doc.to_dict().get("id_camion")
+    }
+
+
+def _load_conductores(db) -> dict[str, dict]:
+    return {
+        doc.to_dict().get("id_conductor"): doc.to_dict()
+        for doc in db.collection("conductor").stream()
+        if doc.to_dict().get("id_conductor")
+    }
+
+
+def _camion_summary(camion: dict | None) -> dict | None:
+    if not camion:
+        return None
+    return {
+        "id_camion": camion.get("id_camion"),
+        "patente": camion.get("patente"),
+        "marca": camion.get("marca"),
+        "modelo": camion.get("modelo"),
+        "color": camion.get("color"),
+        "estado": camion.get("estado"),
+    }
+
+
+def _conductor_summary(conductor: dict | None) -> dict | None:
+    if not conductor:
+        return None
+    return {
+        "id_conductor": conductor.get("id_conductor"),
+        "rut": conductor.get("rut"),
+        "nombre": conductor.get("nombre"),
+        "apellido": conductor.get("apellido"),
+        "telefono": conductor.get("telefono"),
+        "licencia": conductor.get("licencia"),
+        "estado": conductor.get("estado"),
+    }
+
+
+def _enrich_camion_conductor_relationships(db, camiones: list[dict], conductores: list[dict]) -> None:
+    conductores_by_id = {item.get("id_conductor"): item for item in conductores if item.get("id_conductor")}
+    camiones_by_id = {item.get("id_camion"): item for item in camiones if item.get("id_camion")}
+
+    camion_to_conductor: dict[str, str] = {}
+    conductor_to_camion: dict[str, str] = {}
+
+    for camion in camiones:
+        id_camion = camion.get("id_camion")
+        id_conductor = camion.get("id_conductor")
+        if id_camion and id_conductor:
+            camion_to_conductor[id_camion] = id_conductor
+            conductor_to_camion.setdefault(id_conductor, id_camion)
+
+    for conductor in conductores:
+        id_conductor = conductor.get("id_conductor")
+        id_camion = conductor.get("id_camion")
+        if id_conductor and id_camion:
+            conductor_to_camion[id_conductor] = id_camion
+            camion_to_conductor.setdefault(id_camion, id_conductor)
+
+    for camion in camiones:
+        id_camion = camion.get("id_camion")
+        id_conductor = camion_to_conductor.get(id_camion)
+        camion["id_conductor"] = id_conductor
+        camion["conductor"] = _conductor_summary(conductores_by_id.get(id_conductor)) if id_conductor else None
+
+    for conductor in conductores:
+        id_conductor = conductor.get("id_conductor")
+        id_camion = conductor_to_camion.get(id_conductor)
+        conductor["id_camion"] = id_camion
+        conductor["camion"] = _camion_summary(camiones_by_id.get(id_camion)) if id_camion else None
+
+
+def _set_camion_conductor_assignment(db, id_camion: str, id_conductor: str) -> None:
+    camion_ref = db.collection("camion").document(id_camion)
+    conductor_ref = db.collection("conductor").document(id_conductor)
+    camion_snap = camion_ref.get()
+    conductor_snap = conductor_ref.get()
+    if not camion_snap.exists:
+        raise HTTPException(status_code=404, detail="Camión no encontrado")
+    if not conductor_snap.exists:
+        raise HTTPException(status_code=404, detail="Conductor no encontrado")
+
+    camion_data = camion_snap.to_dict()
+    conductor_data = conductor_snap.to_dict()
+    camion_actual = camion_data.get("id_conductor")
+    conductor_actual = conductor_data.get("id_camion")
+
+    if camion_actual and camion_actual != id_conductor:
+        raise HTTPException(status_code=409, detail="El camión ya tiene un conductor asignado")
+    if conductor_actual and conductor_actual != id_camion:
+        raise HTTPException(status_code=409, detail="El conductor ya tiene un camión asignado")
+
+    otros_camiones = list(_where_eq(db.collection("camion"), "id_conductor", id_conductor).limit(2).stream())
+    if any(doc.id != id_camion for doc in otros_camiones):
+        raise HTTPException(status_code=409, detail="El conductor ya tiene un camión asignado")
+
+    otros_conductores = list(
+        _where_eq(db.collection("conductor"), "id_camion", id_camion).limit(2).stream()
+    )
+    if any(doc.id != id_conductor for doc in otros_conductores):
+        raise HTTPException(status_code=409, detail="El camión ya tiene un conductor asignado")
+
+    now = datetime.now(timezone.utc).isoformat()
+    camion_ref.update({"id_conductor": id_conductor, "updated_at": now})
+    conductor_ref.update({"id_camion": id_camion, "updated_at": now})
+
+
+def _clear_camion_conductor_assignment(db, id_camion: str | None = None, id_conductor: str | None = None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    camion_ref = db.collection("camion").document(id_camion) if id_camion else None
+    conductor_ref = db.collection("conductor").document(id_conductor) if id_conductor else None
+
+    camion_snap = camion_ref.get() if camion_ref else None
+    conductor_snap = conductor_ref.get() if conductor_ref else None
+    camion_data = camion_snap.to_dict() if camion_snap and camion_snap.exists else None
+    conductor_data = conductor_snap.to_dict() if conductor_snap and conductor_snap.exists else None
+
+    if camion_data is None and conductor_data is None:
+        raise HTTPException(status_code=404, detail="Asignación no encontrada")
+
+    resolved_camion_id = id_camion or conductor_data.get("id_camion")
+    resolved_conductor_id = id_conductor or camion_data.get("id_conductor")
+    if resolved_conductor_id is None and resolved_camion_id:
+        conductor_docs = list(
+            _where_eq(db.collection("conductor"), "id_camion", resolved_camion_id).limit(1).stream()
+        )
+        if conductor_docs:
+            resolved_conductor_id = conductor_docs[0].to_dict().get("id_conductor")
+    if resolved_camion_id is None and resolved_conductor_id:
+        camion_docs = list(
+            _where_eq(db.collection("camion"), "id_conductor", resolved_conductor_id).limit(1).stream()
+        )
+        if camion_docs:
+            resolved_camion_id = camion_docs[0].to_dict().get("id_camion")
+
+    if resolved_camion_id:
+        db.collection("camion").document(resolved_camion_id).update(
+            {"id_conductor": None, "updated_at": now}
+        )
+    if resolved_conductor_id:
+        db.collection("conductor").document(resolved_conductor_id).update(
+            {"id_camion": None, "updated_at": now}
+        )
+
+
+def _load_movimientos_por_camion(db) -> dict[str, list[dict]]:
+    visitas_by_id = {
+        doc.to_dict().get("id_visita"): doc.to_dict()
+        for doc in db.collection("visita").stream()
+        if doc.to_dict().get("id_visita")
+    }
+    movimientos_por_camion: dict[str, list[dict]] = {}
+    for doc in db.collection("movimiento_acceso").stream():
+        mov = doc.to_dict()
+        visita = visitas_by_id.get(mov.get("id_visita"))
+        if not visita:
+            continue
+        id_camion = visita.get("id_camion")
+        timestamp = _parse_iso_datetime(mov.get("fecha_hora_movimiento"))
+        if not id_camion or timestamp is None:
+            continue
+        movimientos_por_camion.setdefault(id_camion, []).append({**mov, "_dt": timestamp})
+    for id_camion in movimientos_por_camion:
+        movimientos_por_camion[id_camion].sort(key=lambda item: item["_dt"])
+    return movimientos_por_camion
+
+
+def _filter_movimientos_en_ventana(
+    movimientos: list[dict],
+    inicio: datetime | None,
+    fin: datetime | None = None,
+) -> list[dict]:
+    if inicio is None:
+        return []
+    salida = []
+    for mov in movimientos:
+        timestamp = mov.get("_dt")
+        if timestamp is None or timestamp < inicio:
+            continue
+        if fin is not None and timestamp > fin:
+            continue
+        salida.append(mov)
+    return salida
 
 
 @router.post("/camiones")
@@ -68,6 +286,8 @@ def list_camiones(user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     data = [doc.to_dict() for doc in db.collection("camion").stream()]
     data.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    conductores = [doc.to_dict() for doc in db.collection("conductor").stream()]
+    _enrich_camion_conductor_relationships(db, data, conductores)
     return {"status": "ok", "data": data}
 
 
@@ -77,7 +297,10 @@ def get_camion(id_camion: str, user: dict = Depends(get_current_user)) -> dict:
     snap = db.collection("camion").document(id_camion).get()
     if not snap.exists:
         raise HTTPException(status_code=404, detail="Camión no encontrado")
-    return {"status": "ok", "data": snap.to_dict()}
+    camiones = [snap.to_dict()]
+    conductores = [doc.to_dict() for doc in db.collection("conductor").stream()]
+    _enrich_camion_conductor_relationships(db, camiones, conductores)
+    return {"status": "ok", "data": camiones[0]}
 
 
 @router.put("/camiones/{id_camion}")
@@ -103,8 +326,15 @@ def update_camion(id_camion: str, payload: CamionUpdate, user: dict = Depends(ge
 def delete_camion(id_camion: str, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     ref = db.collection("camion").document(id_camion)
-    if not ref.get().exists:
+    snap = ref.get()
+    if not snap.exists:
         raise HTTPException(status_code=404, detail="Camión no encontrado")
+    conductor_id = snap.to_dict().get("id_conductor")
+    if conductor_id:
+        conductor_ref = db.collection("conductor").document(conductor_id)
+        conductor_snap = conductor_ref.get()
+        if conductor_snap.exists and conductor_snap.to_dict().get("id_camion") == id_camion:
+            conductor_ref.update({"id_camion": None, "updated_at": datetime.now(timezone.utc).isoformat()})
     ref.delete()
     return {"status": "ok"}
 
@@ -146,6 +376,8 @@ def list_conductores(user: dict = Depends(get_current_user)) -> dict:
             tags_by_conductor[id_c] = tag
     for conductor in data:
         conductor["tag"] = tags_by_conductor.get(conductor["id_conductor"])
+    camiones = [doc.to_dict() for doc in db.collection("camion").stream()]
+    _enrich_camion_conductor_relationships(db, camiones, data)
     return {"status": "ok", "data": data}
 
 
@@ -168,13 +400,79 @@ def update_conductor(id_conductor: str, payload: ConductorUpdate, user: dict = D
     return {"status": "ok", "data": {**current, **update_data}}
 
 
+@router.get("/conductores/{id_conductor}")
+def get_conductor(id_conductor: str, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    snap = db.collection("conductor").document(id_conductor).get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Conductor no encontrado")
+    conductor = snap.to_dict()
+    tags_by_conductor: dict[str, dict] = {}
+    for tag_doc in db.collection("tag_rfid").stream():
+        tag = tag_doc.to_dict()
+        linked_id = tag.get("id_conductor")
+        if linked_id:
+            tags_by_conductor[linked_id] = tag
+    conductor["tag"] = tags_by_conductor.get(id_conductor)
+    conductores = [conductor]
+    camiones = [doc.to_dict() for doc in db.collection("camion").stream()]
+    _enrich_camion_conductor_relationships(db, camiones, conductores)
+    return {"status": "ok", "data": conductores[0]}
+
+
 @router.delete("/conductores/{id_conductor}")
 def delete_conductor(id_conductor: str, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
     ref = db.collection("conductor").document(id_conductor)
-    if not ref.get().exists:
+    snap = ref.get()
+    if not snap.exists:
         raise HTTPException(status_code=404, detail="Conductor no encontrado")
+    camion_id = snap.to_dict().get("id_camion")
+    if camion_id:
+        camion_ref = db.collection("camion").document(camion_id)
+        camion_snap = camion_ref.get()
+        if camion_snap.exists and camion_snap.to_dict().get("id_conductor") == id_conductor:
+            camion_ref.update({"id_conductor": None, "updated_at": datetime.now(timezone.utc).isoformat()})
     ref.delete()
+    return {"status": "ok"}
+
+
+@router.put("/camiones/{id_camion}/asignar-conductor")
+def asignar_conductor_a_camion(
+    id_camion: str,
+    payload: CamionConductorAsignacion,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    db = get_firestore_client()
+    _set_camion_conductor_assignment(db, id_camion, payload.id_conductor)
+    return {"status": "ok"}
+
+
+@router.delete("/camiones/{id_camion}/asignar-conductor")
+def desasignar_conductor_de_camion(id_camion: str, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    _clear_camion_conductor_assignment(db, id_camion=id_camion)
+    return {"status": "ok"}
+
+
+@router.put("/conductores/{id_conductor}/asignar-camion")
+def asignar_camion_a_conductor(
+    id_conductor: str,
+    payload: ConductorCamionAsignacion,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    db = get_firestore_client()
+    _set_camion_conductor_assignment(db, payload.id_camion, id_conductor)
+    return {"status": "ok"}
+
+
+@router.delete("/conductores/{id_conductor}/asignar-camion")
+def desasignar_camion_de_conductor(
+    id_conductor: str,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    db = get_firestore_client()
+    _clear_camion_conductor_assignment(db, id_conductor=id_conductor)
     return {"status": "ok"}
 
 
@@ -297,7 +595,7 @@ def create_punto_control(payload: PuntoControlCreate, user: dict = Depends(get_c
         "id_esp32": payload.id_esp32,
         "ubicacion": payload.ubicacion,
         "cordenadas": payload.cordenadas,
-        "activo": True,
+        "activo": payload.activo,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     ref.document(id_punto_control).set(record)
@@ -344,6 +642,29 @@ def update_punto_control(
     return {"status": "ok", "data": merged}
 
 
+@router.delete("/puntos-control/{id_punto_control}")
+def delete_punto_control(id_punto_control: str, user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    ref = db.collection("punto_control").document(id_punto_control)
+    snap = ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Punto de control no encontrado")
+
+    rutas_en_uso = []
+    for ruta_doc in db.collection("ruta").stream():
+        ruta = ruta_doc.to_dict()
+        if any(item.get("id_punto_control") == id_punto_control for item in ruta.get("puntos", [])):
+            rutas_en_uso.append(ruta.get("nombre") or ruta.get("id_ruta"))
+    if rutas_en_uso:
+        raise HTTPException(
+            status_code=409,
+            detail="No se puede eliminar el punto porque está asignado a una ruta",
+        )
+
+    ref.delete()
+    return {"status": "ok"}
+
+
 @router.post("/rutas")
 def create_ruta(payload: RutaCreate, user: dict = Depends(get_current_user)) -> dict:
     db = get_firestore_client()
@@ -383,6 +704,10 @@ def list_rutas(user: dict = Depends(get_current_user)) -> dict:
                     "id_punto_control": p.get("id_punto_control"),
                     "orden": p.get("orden"),
                     "nombre_punto": punto.get("nombre"),
+                    "tipo_punto": punto.get("tipo_punto"),
+                    "ubicacion": punto.get("ubicacion"),
+                    "cordenadas": punto.get("cordenadas"),
+                    "activo": punto.get("activo", True),
                 }
             )
         ruta["puntos"] = sorted(enriched, key=lambda x: x.get("orden", 0))
@@ -482,6 +807,7 @@ def list_ruta_asignaciones(id_ruta: str | None = None, user: dict = Depends(get_
 def get_seguimiento_ruta(
     id_ruta: str,
     id_camion: str,
+    id_asignacion_ruta: str | None = None,
     user: dict = Depends(get_current_user),
 ) -> dict:
     db = get_firestore_client()
@@ -505,22 +831,25 @@ def get_seguimiento_ruta(
     if not asignaciones:
         return {"status": "ok", "data": {"id_ruta": id_ruta, "id_camion": id_camion, "puntos": []}}
     asignaciones.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    asignacion = asignaciones[0]
+    if id_asignacion_ruta:
+        asignacion = next(
+            (item for item in asignaciones if item.get("id_asignacion_ruta") == id_asignacion_ruta),
+            None,
+        )
+        if asignacion is None:
+            raise HTTPException(status_code=404, detail="Recorrido no encontrado")
+    else:
+        asignacion = next((item for item in asignaciones if item.get("activa")), asignaciones[0])
     hora_inicio = _parse_iso_datetime(asignacion.get("hora_inicio"))
     if hora_inicio is None:
         return {"status": "ok", "data": {"id_ruta": id_ruta, "id_camion": id_camion, "puntos": []}}
-    movimientos = [doc.to_dict() for doc in db.collection("movimiento_acceso").stream()]
-    visitas = [doc.to_dict() for doc in _where_eq(db.collection("visita"), "id_camion", id_camion).stream()]
-    ids_visita = {v.get("id_visita") for v in visitas}
-    movs_camion = []
-    for mov in movimientos:
-        if mov.get("id_visita") not in ids_visita:
-            continue
-        ts = _parse_iso_datetime(mov.get("fecha_hora_movimiento"))
-        if ts is None or ts < hora_inicio:
-            continue
-        movs_camion.append({**mov, "_dt": ts})
-    movs_camion.sort(key=lambda x: x["_dt"])
+    hora_fin = _parse_iso_datetime(asignacion.get("fecha_fin"))
+    movimientos_por_camion = _load_movimientos_por_camion(db)
+    movs_camion = _filter_movimientos_en_ventana(
+        movimientos_por_camion.get(id_camion, []),
+        hora_inicio,
+        hora_fin,
+    )
     pass_map: dict[str, datetime] = {}
     for mov in movs_camion:
         pid = mov.get("id_punto_control")
@@ -579,15 +908,14 @@ def get_seguimiento_ruta(
                     mins = minutes % 60
                     actual["tiempo_en_punto"] = f"{hours:02d}:{mins:02d}"
                     actual["referencia_tiempo_en_punto"] = previo_dt.isoformat()
-    for item in salida:
-        if item["fecha_hora_paso"] is None:
-            item["fecha_hora_paso"] = "--:--; --/--"
     return {
         "status": "ok",
         "data": {
             "id_ruta": id_ruta,
             "id_camion": id_camion,
+            "id_asignacion_ruta": asignacion.get("id_asignacion_ruta"),
             "hora_inicio": hora_inicio.isoformat(),
+            "fecha_fin": hora_fin.isoformat() if hora_fin else None,
             "puntos": salida,
         },
     }
@@ -607,27 +935,20 @@ def get_metricas_rutas(id_ruta: str, user: dict = Depends(get_current_user)) -> 
         doc.to_dict().get("id_punto_control"): doc.to_dict()
         for doc in db.collection("punto_control").stream()
     }
-    camiones = {
-        doc.to_dict().get("id_camion"): doc.to_dict()
-        for doc in db.collection("camion").stream()
-    }
-    visitas = [doc.to_dict() for doc in db.collection("visita").stream()]
-    visita_por_camion: dict[str, set[str]] = {}
-    for v in visitas:
-        cid = v.get("id_camion")
-        vid = v.get("id_visita")
-        if cid and vid:
-            visita_por_camion.setdefault(cid, set()).add(vid)
-    movimientos = [doc.to_dict() for doc in db.collection("movimiento_acceso").stream()]
+    camiones = _load_camiones(db)
+    movimientos_por_camion = _load_movimientos_por_camion(db)
     asignaciones = [
         doc.to_dict()
         for doc in _where_eq(db.collection("ruta_camion_asignacion"), "id_ruta", id_ruta).stream()
     ]
     puntos_metricas = []
     for index in range(1, len(puntos_ruta)):
-        prev_pid = puntos_ruta[index - 1].get("id_punto_control")
-        curr_pid = puntos_ruta[index].get("id_punto_control")
-        curr_nombre = puntos_lookup.get(curr_pid, {}).get("nombre")
+        punto_anterior = puntos_ruta[index - 1]
+        punto_actual = puntos_ruta[index]
+        prev_pid = punto_anterior.get("id_punto_control")
+        curr_pid = punto_actual.get("id_punto_control")
+        prev_nombre = puntos_lookup.get(prev_pid, {}).get("nombre") or prev_pid
+        curr_nombre = puntos_lookup.get(curr_pid, {}).get("nombre") or curr_pid
         registros = []
         for asignacion in asignaciones:
             cid = asignacion.get("id_camion")
@@ -636,23 +957,20 @@ def get_metricas_rutas(id_ruta: str, user: dict = Depends(get_current_user)) -> 
             hora_inicio = _parse_iso_datetime(asignacion.get("hora_inicio"))
             if hora_inicio is None:
                 continue
-            ids_visita = visita_por_camion.get(cid, set())
-            movs = []
-            for mov in movimientos:
-                if mov.get("id_visita") not in ids_visita:
-                    continue
-                dt = _parse_iso_datetime(mov.get("fecha_hora_movimiento"))
-                if dt is None or dt < hora_inicio:
-                    continue
-                movs.append({**mov, "_dt": dt})
-            movs.sort(key=lambda x: x["_dt"])
+            hora_fin = _parse_iso_datetime(asignacion.get("fecha_fin"))
+            movs = _filter_movimientos_en_ventana(
+                movimientos_por_camion.get(cid, []),
+                hora_inicio,
+                hora_fin,
+            )
             t_prev = None
             t_curr = None
             for mov in movs:
                 pid = mov.get("id_punto_control")
                 if pid == prev_pid and t_prev is None:
                     t_prev = mov["_dt"]
-                if pid == curr_pid and t_curr is None:
+                    continue
+                if pid == curr_pid and t_prev is not None and t_curr is None:
                     t_curr = mov["_dt"]
                 if t_prev and t_curr:
                     break
@@ -663,7 +981,10 @@ def get_metricas_rutas(id_ruta: str, user: dict = Depends(get_current_user)) -> 
                     {
                         "id_camion": cid,
                         "patente": cam.get("patente"),
+                        "id_asignacion_ruta": asignacion.get("id_asignacion_ruta"),
                         "fecha_hora": t_curr.isoformat(),
+                        "fecha_hora_desde": t_prev.isoformat(),
+                        "fecha_hora_hasta": t_curr.isoformat(),
                         "duracion_min": round(dur_min, 2),
                     }
                 )
@@ -678,15 +999,28 @@ def get_metricas_rutas(id_ruta: str, user: dict = Depends(get_current_user)) -> 
             avg = None
         puntos_metricas.append(
             {
+                "id_segmento": f"{prev_pid}__{curr_pid}",
+                "desde": {
+                    "id_punto_control": prev_pid,
+                    "nombre_punto": prev_nombre,
+                    "orden": int(punto_anterior.get("orden", index)),
+                },
+                "hasta": {
+                    "id_punto_control": curr_pid,
+                    "nombre_punto": curr_nombre,
+                    "orden": int(punto_actual.get("orden", index + 1)),
+                },
                 "id_punto_control": curr_pid,
                 "nombre_punto": curr_nombre,
-                "orden": int(puntos_ruta[index].get("orden", index + 1)),
-                "transicion_desde_orden": int(puntos_ruta[index - 1].get("orden", index)),
+                "nombre_punto_anterior": prev_nombre,
+                "orden": int(punto_actual.get("orden", index + 1)),
+                "transicion_desde_orden": int(punto_anterior.get("orden", index)),
                 "registros": registros,
                 "resumen": {
                     "tiempo_mas_alto": max_item,
                     "tiempo_mas_bajo": min_item,
                     "tiempo_promedio_min": avg,
+                    "tiempo_estimado_min": avg,
                 },
             }
         )
@@ -835,6 +1169,87 @@ def dashboard_summary(user: dict = Depends(get_current_user)) -> DashboardSummar
         ingresos_hoy=ingresos_hoy,
         tiempo_promedio_estadia_min=promedio,
     )
+
+
+@router.get("/dashboard/ubicacion-tiempo-real")
+def dashboard_ubicacion_tiempo_real(user: dict = Depends(get_current_user)) -> dict:
+    db = get_firestore_client()
+    visitas = [doc.to_dict() for doc in db.collection("visita").stream()]
+    visitas_activas = [
+        item
+        for item in visitas
+        if item.get("estado_visita") == "en_planta" and item.get("fecha_hora_salida") in (None, "")
+    ]
+    if not visitas_activas:
+        return {"status": "ok", "data": []}
+
+    visita_activa_por_camion: dict[str, dict] = {}
+    for visita in visitas_activas:
+        id_camion = visita.get("id_camion")
+        if not id_camion:
+            continue
+        actual = visita_activa_por_camion.get(id_camion)
+        ingreso_actual = _parse_iso_datetime(actual.get("fecha_hora_ingreso")) if actual else None
+        ingreso_visita = _parse_iso_datetime(visita.get("fecha_hora_ingreso"))
+        if actual is None or (
+            ingreso_visita is not None and (ingreso_actual is None or ingreso_visita > ingreso_actual)
+        ):
+            visita_activa_por_camion[id_camion] = visita
+
+    visitas_por_id = {
+        visita.get("id_visita"): visita
+        for visita in visita_activa_por_camion.values()
+        if visita.get("id_visita")
+    }
+    if not visitas_por_id:
+        return {"status": "ok", "data": []}
+
+    puntos = {
+        doc.to_dict().get("id_punto_control"): doc.to_dict()
+        for doc in db.collection("punto_control").stream()
+    }
+    camiones = _load_camiones(db)
+    conductores = _load_conductores(db)
+
+    ultimos_movimientos: dict[str, dict] = {}
+    for doc in db.collection("movimiento_acceso").stream():
+        movimiento = doc.to_dict()
+        visita = visitas_por_id.get(movimiento.get("id_visita"))
+        if not visita:
+            continue
+        id_camion = visita.get("id_camion")
+        timestamp = _parse_iso_datetime(movimiento.get("fecha_hora_movimiento"))
+        if not id_camion or timestamp is None:
+            continue
+        actual = ultimos_movimientos.get(id_camion)
+        if actual is None or timestamp > actual["_dt"]:
+            ultimos_movimientos[id_camion] = {**movimiento, "_dt": timestamp, "_visita": visita}
+
+    markers = []
+    for id_camion, movimiento in ultimos_movimientos.items():
+        visita = movimiento["_visita"]
+        punto = puntos.get(movimiento.get("id_punto_control"), {})
+        coords = _parse_coords(punto.get("cordenadas"))
+        if coords is None:
+            continue
+        camion = camiones.get(id_camion, {})
+        conductor = conductores.get(visita.get("id_conductor"), {})
+        nombre_conductor = f"{conductor.get('nombre', '')} {conductor.get('apellido', '')}".strip() or "-"
+        markers.append(
+            {
+                "id_camion": id_camion,
+                "patente": camion.get("patente") or id_camion,
+                "id_conductor": visita.get("id_conductor"),
+                "conductor": nombre_conductor,
+                "id_punto_control": movimiento.get("id_punto_control"),
+                "punto_control": punto.get("nombre") or movimiento.get("id_punto_control"),
+                "cordenadas": coords,
+                "fecha_hora_movimiento": movimiento["_dt"].isoformat(),
+            }
+        )
+
+    markers.sort(key=lambda item: item.get("fecha_hora_movimiento", ""), reverse=True)
+    return {"status": "ok", "data": markers}
 
 
 @router.get("/tipos-punto-control")

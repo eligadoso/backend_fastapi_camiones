@@ -56,6 +56,14 @@ class TagConductorAsignacion(BaseModel):
     id_conductor: str
 
 
+class CamionConductorAsignacion(BaseModel):
+    id_conductor: str
+
+
+class ConductorCamionAsignacion(BaseModel):
+    id_camion: str
+
+
 class TipoPuntoCreate(BaseModel):
     nombre: str
     descripcion: str | None = None
@@ -84,6 +92,7 @@ class PuntoControlCreate(BaseModel):
     id_zona: str | None = None
     ubicacion: str | None = None
     cordenadas: str | None = None
+    activo: bool = True
 
 
 class PuntoControlUpdate(BaseModel):
