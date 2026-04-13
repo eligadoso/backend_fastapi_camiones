@@ -293,6 +293,84 @@ class WebhookController:
 
         return id_camion, id_conductor
 
+    # ------------------------------------------------------------------
+    # Lógica de recorridos (ruta_camion_asignacion)
+    # ------------------------------------------------------------------
+
+    def _get_recorrido_en_proceso(self, id_camion: str) -> dict | None:
+        """Devuelve el único recorrido en estado 'en_proceso' para el camión dado.
+
+        Prioridad: estado_recorrido == "en_proceso" (campo nuevo).
+        Fallback para registros anteriores: activa == True sin estado_recorrido.
+        Si existe más de uno (error de datos), se usa el de hora_inicio más reciente y
+        se registra un warning.
+        """
+        # Búsqueda por estado_recorrido (campo nuevo)
+        docs_en_proceso = list(
+            self._where_eq(
+                self._where_eq(
+                    self._db.collection("ruta_camion_asignacion"),
+                    "id_camion",
+                    id_camion,
+                ),
+                "estado_recorrido",
+                "en_proceso",
+            )
+            .stream()
+        )
+        if docs_en_proceso:
+            if len(docs_en_proceso) > 1:
+                print(
+                    f"[WARN] Camión {id_camion} tiene {len(docs_en_proceso)} recorridos en_proceso "
+                    f"simultáneos. Se usará el de hora_inicio más reciente."
+                )
+            docs_en_proceso.sort(
+                key=lambda d: d.to_dict().get("hora_inicio", ""),
+                reverse=True,
+            )
+            return docs_en_proceso[0].to_dict()
+
+        # Fallback: activa=True sin estado_recorrido (compatibilidad con datos anteriores)
+        docs_activos = list(
+            self._where_eq(
+                self._where_eq(
+                    self._db.collection("ruta_camion_asignacion"),
+                    "id_camion",
+                    id_camion,
+                ),
+                "activa",
+                True,
+            )
+            .stream()
+        )
+        # Excluir los que tengan estado_recorrido explícito (ya cubiertos arriba)
+        docs_activos = [
+            d for d in docs_activos
+            if not d.to_dict().get("estado_recorrido")
+        ]
+        if docs_activos:
+            docs_activos.sort(
+                key=lambda d: d.to_dict().get("hora_inicio", ""),
+                reverse=True,
+            )
+            return docs_activos[0].to_dict()
+
+        return None
+
+    def _inicializar_puntos_estado(self, puntos_snapshot: list[dict]) -> list[dict]:
+        """Construye el estado inicial de puntos (todos pendientes)."""
+        return [
+            {
+                "id_punto_control": p["id_punto_control"],
+                "orden": int(p.get("orden", 0)),
+                "estado": "pendiente",
+                "fecha_hora_paso": None,
+                "id_lectura": None,
+                "id_movimiento": None,
+            }
+            for p in sorted(puntos_snapshot, key=lambda x: int(x.get("orden", 0)))
+        ]
+
     def _register_movimiento_desde_lectura(
         self,
         id_tag: str,
@@ -300,75 +378,250 @@ class WebhookController:
         id_lectura: str,
         timestamp: str,
     ) -> None:
+        """Procesa una lectura RFID contra el recorrido activo del camión.
+
+        Flujo:
+        1. UID (tag) → conductor → camión
+        2. Camión → recorrido en estado 'en_proceso'
+        3. Validar punto recibido contra puntos_snapshot del recorrido
+        4. Aplicar lógica de casos A/B/C/D
+        5. Persistir puntos_estado y crear movimiento_acceso con link directo al recorrido
+        """
+        # 1. Resolver camión y conductor a partir del tag
         id_camion, id_conductor = self._resolve_camion_conductor_para_tag(id_tag)
-        if not id_camion or not id_conductor:
-            print(f"[ThingSpeak] Sin asignación activa para tag={id_tag}, movimiento no registrado")
+        if not id_camion:
+            print(f"[Recorrido] Sin camión resuelto para tag={id_tag}. Lectura ignorada.")
             return
-        punto_snap = self._db.collection("punto_control").document(id_punto_control).get()
-        if not punto_snap.exists:
+        if not id_conductor:
+            print(f"[Recorrido] Tag={id_tag} resuelve camión={id_camion} pero sin conductor. Lectura ignorada.")
             return
-        punto = punto_snap.to_dict()
-        tipo_punto = punto.get("tipo_punto", "checkpoint")
+
+        # 2. Obtener recorrido activo (exclusivamente "en_proceso")
+        recorrido = self._get_recorrido_en_proceso(id_camion)
+        if not recorrido:
+            print(
+                f"[Recorrido] Camión={id_camion} no tiene recorrido en_proceso. "
+                f"Lectura id_lectura={id_lectura} ignorada para rutas."
+            )
+            return
+
+        id_asignacion_ruta = recorrido["id_asignacion_ruta"]
+
+        # 3. Verificar que el punto pertenece a este recorrido (Caso D)
+        puntos_snapshot: list[dict] = sorted(
+            recorrido.get("puntos_snapshot") or [],
+            key=lambda x: int(x.get("orden", 0)),
+        )
+        if not puntos_snapshot:
+            print(f"[Recorrido] Recorrido={id_asignacion_ruta} no tiene puntos_snapshot. Lectura ignorada.")
+            return
+
+        punto_ids_en_ruta = {p["id_punto_control"] for p in puntos_snapshot}
+        if id_punto_control not in punto_ids_en_ruta:
+            print(
+                f"[Recorrido] Punto={id_punto_control} NO pertenece al recorrido={id_asignacion_ruta}. "
+                f"Caso D — ignorado."
+            )
+            return
+
+        # 4. Obtener o inicializar puntos_estado
+        puntos_estado: list[dict] = recorrido.get("puntos_estado") or self._inicializar_puntos_estado(
+            puntos_snapshot
+        )
+        puntos_estado.sort(key=lambda x: int(x.get("orden", 0)))
+
+        # Reconciliación defensiva: si hay puntos en puntos_snapshot que no están en
+        # puntos_estado (ocurre cuando se agregó un punto al recorrido antes de que
+        # llegara la primera lectura RFID, dejando puntos_estado incompleto), se añaden
+        # como "pendiente" para que el algoritmo de omisión los procese correctamente.
+        ids_en_estado = {p["id_punto_control"] for p in puntos_estado}
+        faltantes = [
+            {
+                "id_punto_control": p["id_punto_control"],
+                "orden": int(p.get("orden", 0)),
+                "estado": "pendiente",
+                "fecha_hora_paso": None,
+                "id_lectura": None,
+                "id_movimiento": None,
+            }
+            for p in puntos_snapshot
+            if p["id_punto_control"] not in ids_en_estado
+        ]
+        if faltantes:
+            puntos_estado.extend(faltantes)
+            puntos_estado.sort(key=lambda x: int(x.get("orden", 0)))
+            print(
+                f"[Recorrido] Reconciliación: {len(faltantes)} punto(s) agregado(s) a puntos_estado "
+                f"del recorrido={id_asignacion_ruta}."
+            )
+
+        # Buscar el estado del punto recibido
+        punto_estado = next(
+            (p for p in puntos_estado if p["id_punto_control"] == id_punto_control),
+            None,
+        )
+        if punto_estado is None:
+            # No debería ocurrir si puntos_snapshot y puntos_estado son coherentes
+            print(f"[Recorrido] Inconsistencia: punto={id_punto_control} en snapshot pero no en estado.")
+            return
+
+        # Caso A: el punto ya fue procesado (pasado u omitido) → idempotencia, ignorar
+        if punto_estado["estado"] in ("pasado", "omitido"):
+            print(
+                f"[Recorrido] Punto={id_punto_control} ya tiene estado='{punto_estado['estado']}' "
+                f"en recorrido={id_asignacion_ruta}. Caso A — ignorado."
+            )
+            return
+
+        # Determinar el próximo pendiente esperado
+        pendientes = [p for p in puntos_estado if p["estado"] == "pendiente"]
+        if not pendientes:
+            # Todos procesados; el recorrido debería haberse completado ya
+            print(f"[Recorrido] Recorrido={id_asignacion_ruta} sin pendientes pero llegó lectura. Ignorado.")
+            return
+
+        orden_recibido = int(punto_estado.get("orden", 0))
+        orden_esperado = int(pendientes[0].get("orden", 0))
+
+        ahora = datetime.now(timezone.utc).isoformat()
+
+        if orden_recibido == orden_esperado:
+            # Caso B: es exactamente el siguiente esperado
+            punto_estado["estado"] = "pasado"
+            punto_estado["fecha_hora_paso"] = timestamp
+            punto_estado["id_lectura"] = id_lectura
+            print(f"[Recorrido] Caso B — punto={id_punto_control} registrado como pasado.")
+
+        elif orden_recibido > orden_esperado:
+            # Caso C: punto adelantado → marcar intermedios como omitido
+            omitidos = []
+            for p in puntos_estado:
+                if p["estado"] == "pendiente" and int(p.get("orden", 0)) < orden_recibido:
+                    p["estado"] = "omitido"
+                    omitidos.append(p["id_punto_control"])
+            punto_estado["estado"] = "pasado"
+            punto_estado["fecha_hora_paso"] = timestamp
+            punto_estado["id_lectura"] = id_lectura
+            print(
+                f"[Recorrido] Caso C — punto={id_punto_control} adelantado. "
+                f"Omitidos: {omitidos}. Registrado como pasado."
+            )
+
+        else:
+            # orden_recibido < orden_esperado y estado == "pendiente"
+            # Solo ocurre si puntos_estado está corrupto; ignorar de forma segura
+            print(
+                f"[Recorrido] Punto={id_punto_control} con orden={orden_recibido} < esperado={orden_esperado} "
+                f"y aún pendiente. Estado inconsistente — ignorado."
+            )
+            return
+
+        # 5. Crear movimiento_acceso con link directo al recorrido
+        movimiento_id = uuid4().hex
+        punto_estado["id_movimiento"] = movimiento_id
+
+        # Intentar vincular a visita abierta (compatibilidad con módulo de planta)
         visitas_ref = self._db.collection("visita")
         abiertas = list(
-            self._where_eq(self._where_eq(visitas_ref, "id_camion", id_camion), "estado_visita", "en_planta")
+            self._where_eq(
+                self._where_eq(visitas_ref, "id_camion", id_camion),
+                "estado_visita",
+                "en_planta",
+            )
             .limit(1)
             .stream()
         )
-        visita_id = None
-        if tipo_punto == "porton_entrada":
-            movimiento_tipo = "ingreso"
-        elif tipo_punto == "porton_salida":
-            movimiento_tipo = "salida"
-        else:
-            movimiento_tipo = "salida" if abiertas else "ingreso"
-        if movimiento_tipo == "ingreso":
-            if abiertas:
-                visita_id = abiertas[0].to_dict().get("id_visita")
-            else:
-                visita_id = uuid4().hex
-                visitas_ref.document(visita_id).set(
-                    {
-                        "id_visita": visita_id,
-                        "id_camion": id_camion,
-                        "id_conductor": id_conductor,
-                        "id_planta": "planta_default",
-                        "fecha_hora_ingreso": timestamp,
-                        "fecha_hora_salida": None,
-                        "estado_visita": "en_planta",
-                        "motivo": "lectura_rfid",
-                        "observacion": "Ingreso automático por portón de entrada",
-                        "created_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-        else:
-            if not abiertas:
-                return
-            visita_doc = abiertas[0]
-            visita_id = visita_doc.to_dict().get("id_visita")
-            visita_doc.reference.update(
-                {
-                    "fecha_hora_salida": timestamp,
-                    "estado_visita": "cerrada",
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-        if not visita_id:
-            return
-        movimiento_id = uuid4().hex
+        id_visita = abiertas[0].to_dict().get("id_visita") if abiertas else None
+
+        # Obtener coordenadas del punto de control para el mapa del dashboard.
+        # Se guardan directamente en el movimiento para que dashboard_ubicacion_tiempo_real
+        # pueda resolverlas sin depender de id_visita (que es null en recorridos de ruta).
+        try:
+            punto_doc = self._db.collection("punto_control").document(id_punto_control).get()
+            cordenadas_punto = punto_doc.to_dict().get("cordenadas") if punto_doc.exists else None
+        except Exception:
+            cordenadas_punto = None
+
         self._db.collection("movimiento_acceso").document(movimiento_id).set(
             {
                 "id_movimiento": movimiento_id,
-                "id_visita": visita_id,
+                "id_asignacion_ruta": id_asignacion_ruta,   # link directo al recorrido
+                "id_visita": id_visita,                      # null si no hay visita de planta abierta
+                "id_camion": id_camion,                      # copia directa → dashboard sin id_visita
+                "id_conductor": id_conductor,                # copia directa → dashboard sin id_visita
                 "id_lectura": id_lectura,
                 "tipo_movimiento": "paso_punto",
-                "direccion_inferida": movimiento_tipo,
                 "fecha_hora_movimiento": timestamp,
                 "id_punto_control": id_punto_control,
+                "cordenadas": cordenadas_punto,              # coords del punto → mapa en tiempo real
                 "validado": True,
-                "observacion": f"Pasó por {tipo_punto}",
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "observacion": f"Punto {punto_estado['estado']} en recorrido {id_asignacion_ruta}",
+                "created_at": ahora,
             }
+        )
+
+        # 6. Persistir puntos_estado actualizado en el recorrido
+        recorrido_ref = self._db.collection("ruta_camion_asignacion").document(id_asignacion_ruta)
+        actualizacion: dict = {
+            "puntos_estado": puntos_estado,
+            "updated_at": ahora,
+        }
+
+        # 7. Verificar si el recorrido queda completo
+        todos_procesados = all(p["estado"] in ("pasado", "omitido") for p in puntos_estado)
+        if todos_procesados:
+            actualizacion["estado_recorrido"] = "finalizado"
+            actualizacion["activa"] = False
+            actualizacion["fecha_fin"] = timestamp
+            print(f"[Recorrido] Recorrido={id_asignacion_ruta} FINALIZADO automáticamente.")
+
+        recorrido_ref.update(actualizacion)
+        print(
+            f"[Recorrido] Movimiento={movimiento_id} registrado. "
+            f"Recorrido={id_asignacion_ruta} camion={id_camion} punto={id_punto_control}"
+        )
+
+        # 8. Si el recorrido se finalizó, activar el siguiente recorrido agendado del camión
+        if todos_procesados:
+            self._activar_siguiente_agendado(id_camion, timestamp)
+
+
+    def _activar_siguiente_agendado(self, id_camion: str, timestamp: str) -> None:
+        """Activa el siguiente recorrido agendado del camión, si existe.
+
+        Regla: solo un recorrido puede estar 'en_proceso' por camión.
+        Cuando el actual finaliza, se busca el próximo 'agendado' ordenado
+        por hora_inicio ascendente y se transiciona a 'en_proceso'.
+        """
+        agendados = list(
+            self._where_eq(
+                self._where_eq(
+                    self._db.collection("ruta_camion_asignacion"),
+                    "id_camion",
+                    id_camion,
+                ),
+                "estado_recorrido",
+                "agendado",
+            )
+            .stream()
+        )
+        if not agendados:
+            print(f"[Recorrido] Camión={id_camion} sin recorridos agendados. Nada que activar.")
+            return
+
+        # Ordenar por hora_inicio ascendente: el más próximo primero
+        agendados.sort(key=lambda d: d.to_dict().get("hora_inicio", ""))
+        siguiente = agendados[0]
+        siguiente_id = siguiente.to_dict().get("id_asignacion_ruta") or siguiente.id
+
+        siguiente.reference.update({
+            "estado_recorrido": "en_proceso",
+            "activa": True,
+            "updated_at": timestamp,
+        })
+        print(
+            f"[Recorrido] Recorrido={siguiente_id} activado automáticamente "
+            f"para camión={id_camion}."
         )
 
 

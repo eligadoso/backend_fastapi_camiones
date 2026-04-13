@@ -21,7 +21,13 @@
 
 ```bash
 pip install -r requirements.txt
-uvicorn app.main:app --reload
+python start.py
+```
+
+Tambien puedes usar:
+
+```bash
+python -m app.main
 ```
 
 ## Prueba de conexión Firebase

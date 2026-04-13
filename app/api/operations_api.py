@@ -7,6 +7,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from app.api.dependencies import get_current_user
 from app.firebase_client import get_firestore_client
 from app.models.api_model import (
+    AgregarPuntoRecorridoPayload,
     AsignacionTagCreate,
     CamionConductorAsignacion,
     CamionCreate,
@@ -836,8 +837,51 @@ def delete_ruta(id_ruta: str, user: dict = Depends(get_current_user)) -> dict:
     return {"status": "ok", "message": "Ruta eliminada"}
 
 
+def _hay_recorrido_en_proceso(db, id_camion: str) -> bool:
+    """Devuelve True si el camión ya tiene un recorrido en estado 'en_proceso'."""
+    # Campo nuevo con estado explícito
+    docs = list(
+        _where_eq(
+            _where_eq(db.collection("ruta_camion_asignacion"), "id_camion", id_camion),
+            "estado_recorrido",
+            "en_proceso",
+        )
+        .limit(1)
+        .stream()
+    )
+    if docs:
+        return True
+    # Fallback: activa=True sin estado_recorrido (registros legacy)
+    docs_legacy = list(
+        _where_eq(
+            _where_eq(db.collection("ruta_camion_asignacion"), "id_camion", id_camion),
+            "activa",
+            True,
+        )
+        .limit(1)
+        .stream()
+    )
+    return any(
+        not d.to_dict().get("estado_recorrido")  # sin campo → legacy activo
+        for d in docs_legacy
+    )
+
+
 @router.post("/seguimiento-rutas/asignaciones")
 def create_ruta_asignacion(payload: RutaCamionAsignacionCreate, user: dict = Depends(get_current_user)) -> dict:
+    """Crea un nuevo recorrido para un camión en una ruta.
+
+    Reglas de estado inicial:
+    - Si el camión ya tiene un recorrido "en_proceso" → nuevo recorrido = "agendado"
+    - Si no hay recorrido "en_proceso":
+        - hora_inicio <= ahora + 5min → "en_proceso"
+        - hora_inicio > ahora + 5min  → "agendado"
+    - Un recorrido nuevo NUNCA se crea como "finalizado".
+
+    La ruta se aísla mediante snapshot: editar la ruta maestra no altera este recorrido.
+    """
+    from datetime import timedelta
+
     db = get_firestore_client()
     ruta_snap = db.collection("ruta").document(payload.id_ruta).get()
     if not ruta_snap.exists:
@@ -845,30 +889,431 @@ def create_ruta_asignacion(payload: RutaCamionAsignacionCreate, user: dict = Dep
     camion = db.collection("camion").document(payload.id_camion).get()
     if not camion.exists:
         raise HTTPException(status_code=404, detail="Camión no encontrado")
-    ref = db.collection("ruta_camion_asignacion")
-    now = datetime.now(timezone.utc).isoformat()
-    active = list(_where_eq(_where_eq(ref, "id_camion", payload.id_camion), "activa", True).stream())
-    for doc in active:
-        doc.reference.update({"activa": False, "fecha_fin": now})
-    id_asignacion_ruta = uuid4().hex
-    # Snapshot de los puntos de la ruta en el momento de creación del recorrido.
-    # Esto garantiza que modificar la ruta NO afecta recorridos ya registrados.
+
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    hora_inicio_utc = payload.hora_inicio.astimezone(timezone.utc)
+
+    # Determinar estado inicial sin tocar recorridos existentes
+    ya_en_proceso = _hay_recorrido_en_proceso(db, payload.id_camion)
+    if ya_en_proceso:
+        # El camión ya está ejecutando un recorrido → el nuevo queda en espera
+        estado_recorrido = "agendado"
+    else:
+        margen = timedelta(minutes=5)
+        estado_recorrido = (
+            "en_proceso"
+            if hora_inicio_utc <= now_dt + margen
+            else "agendado"
+        )
+
+    # Snapshot inmutable de los puntos de la ruta maestra en este instante.
+    # Garantiza que editar la ruta maestra después NO altera este recorrido.
     puntos_snapshot = sorted(
         ruta_snap.to_dict().get("puntos", []),
-        key=lambda x: x.get("orden", 0),
+        key=lambda x: int(x.get("orden", 0)),
     )
+
+    id_asignacion_ruta = uuid4().hex
     record = {
         "id_asignacion_ruta": id_asignacion_ruta,
         "id_ruta": payload.id_ruta,
         "id_camion": payload.id_camion,
-        "hora_inicio": payload.hora_inicio.astimezone(timezone.utc).isoformat(),
-        "activa": True,
+        "hora_inicio": hora_inicio_utc.isoformat(),
+        "activa": estado_recorrido == "en_proceso",
+        "estado_recorrido": estado_recorrido,
         "fecha_fin": None,
         "puntos_snapshot": puntos_snapshot,
+        "puntos_estado": [],  # se construye al llegar la primera lectura RFID
         "created_at": now,
     }
-    ref.document(id_asignacion_ruta).set(record)
+    db.collection("ruta_camion_asignacion").document(id_asignacion_ruta).set(record)
     return {"status": "ok", "data": record}
+
+
+@router.post("/seguimiento-rutas/asignaciones/{id_asignacion_ruta}/iniciar")
+def iniciar_recorrido(id_asignacion_ruta: str, user: dict = Depends(get_current_user)) -> dict:
+    """Transiciona un recorrido de 'agendado' a 'en_proceso'.
+
+    Guarda de unicidad: si el camión ya tiene otro recorrido 'en_proceso', rechaza la operación.
+    """
+    db = get_firestore_client()
+    doc_ref = db.collection("ruta_camion_asignacion").document(id_asignacion_ruta)
+    snap = doc_ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Recorrido no encontrado")
+    data = snap.to_dict()
+    estado_actual = data.get("estado_recorrido")
+
+    if estado_actual == "en_proceso":
+        return {"status": "ok", "message": "El recorrido ya está en proceso", "data": data}
+    if estado_actual in ("finalizado", "cancelado"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No se puede iniciar un recorrido en estado '{estado_actual}'",
+        )
+
+    # Guarda de unicidad: no puede haber dos recorridos en_proceso para el mismo camión
+    id_camion = data.get("id_camion")
+    if id_camion and _hay_recorrido_en_proceso(db, id_camion):
+        raise HTTPException(
+            status_code=409,
+            detail="El camión ya tiene un recorrido 'en_proceso'. Finalízalo antes de iniciar otro.",
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    doc_ref.update({
+        "estado_recorrido": "en_proceso",
+        "activa": True,
+        "updated_at": now,
+    })
+    return {"status": "ok", "message": "Recorrido iniciado", "data": {**data, "estado_recorrido": "en_proceso"}}
+
+
+@router.post("/seguimiento-rutas/asignaciones/{id_asignacion_ruta}/finalizar")
+def finalizar_recorrido(id_asignacion_ruta: str, user: dict = Depends(get_current_user)) -> dict:
+    """Finaliza manualmente un recorrido en_proceso.
+
+    Tras finalizar, activa automáticamente el siguiente recorrido agendado del camión
+    (ordenado por hora_inicio ascendente).
+    """
+    db = get_firestore_client()
+    doc_ref = db.collection("ruta_camion_asignacion").document(id_asignacion_ruta)
+    snap = doc_ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Recorrido no encontrado")
+    data = snap.to_dict()
+    estado_actual = data.get("estado_recorrido")
+
+    if estado_actual == "finalizado":
+        return {"status": "ok", "message": "El recorrido ya está finalizado", "data": data}
+    if estado_actual in ("agendado", "cancelado"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Solo se puede finalizar un recorrido 'en_proceso', no uno en estado '{estado_actual}'",
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    doc_ref.update({
+        "estado_recorrido": "finalizado",
+        "activa": False,
+        "fecha_fin": now,
+        "updated_at": now,
+    })
+
+    # Activar el siguiente recorrido agendado del camión
+    id_camion = data.get("id_camion")
+    siguiente_activado = None
+    if id_camion:
+        agendados = list(
+            _where_eq(
+                _where_eq(db.collection("ruta_camion_asignacion"), "id_camion", id_camion),
+                "estado_recorrido",
+                "agendado",
+            )
+            .stream()
+        )
+        if agendados:
+            agendados.sort(key=lambda d: d.to_dict().get("hora_inicio", ""))
+            siguiente = agendados[0]
+            siguiente_data = siguiente.to_dict()
+            siguiente.reference.update({
+                "estado_recorrido": "en_proceso",
+                "activa": True,
+                "updated_at": now,
+            })
+            siguiente_activado = siguiente_data.get("id_asignacion_ruta") or siguiente.id
+
+    return {
+        "status": "ok",
+        "message": "Recorrido finalizado",
+        "siguiente_activado": siguiente_activado,
+    }
+
+
+@router.post("/seguimiento-rutas/asignaciones/{id_asignacion_ruta}/cancelar")
+def cancelar_recorrido(id_asignacion_ruta: str, user: dict = Depends(get_current_user)) -> dict:
+    """Cancela un recorrido agendado o en_proceso."""
+    db = get_firestore_client()
+    doc_ref = db.collection("ruta_camion_asignacion").document(id_asignacion_ruta)
+    snap = doc_ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Recorrido no encontrado")
+    data = snap.to_dict()
+    estado_actual = data.get("estado_recorrido")
+    if estado_actual in ("finalizado", "cancelado"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"El recorrido ya está en estado '{estado_actual}'",
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    doc_ref.update({
+        "estado_recorrido": "cancelado",
+        "activa": False,
+        "fecha_fin": now,
+        "updated_at": now,
+    })
+    return {"status": "ok", "message": "Recorrido cancelado"}
+
+
+# ---------------------------------------------------------------------------
+# Gestión de puntos dentro de un recorrido
+# ---------------------------------------------------------------------------
+
+def _estados_interactuados() -> frozenset[str]:
+    """Estados de punto que se consideran inamovibles (ya ejecutados)."""
+    return frozenset({"pasado", "omitido"})
+
+
+@router.post("/seguimiento-rutas/asignaciones/{id_asignacion_ruta}/puntos")
+def agregar_punto_recorrido(
+    id_asignacion_ruta: str,
+    payload: AgregarPuntoRecorridoPayload,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Añade un punto de control adicional al snapshot de un recorrido.
+
+    Reglas:
+    - Solo disponible para recorridos en estado 'en_proceso' o 'agendado'.
+    - El punto no debe existir ya en el snapshot del recorrido.
+    - Si se proporciona `orden`, debe ser posterior al último punto interactuado.
+    - Sin `orden`: se asigna automáticamente al final del snapshot.
+    """
+    db = get_firestore_client()
+    doc_ref = db.collection("ruta_camion_asignacion").document(id_asignacion_ruta)
+    snap = doc_ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Recorrido no encontrado")
+    recorrido = snap.to_dict()
+
+    estado = recorrido.get("estado_recorrido")
+    if estado not in ("en_proceso", "agendado"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"No se puede modificar un recorrido en estado '{estado}'. Solo 'en_proceso' o 'agendado'.",
+        )
+
+    # Verificar que el punto existe en la BD
+    punto_snap = db.collection("punto_control").document(payload.id_punto_control).get()
+    if not punto_snap.exists:
+        raise HTTPException(status_code=404, detail="Punto de control no encontrado")
+
+    puntos_snapshot: list[dict] = recorrido.get("puntos_snapshot") or []
+    _pe_raw: list[dict] = recorrido.get("puntos_estado") or []
+    if not _pe_raw and puntos_snapshot:
+        # puntos_estado aún no fue inicializado (ninguna lectura RFID llegó todavía).
+        # Si se agrega un punto directamente a la lista vacía, se perderían los puntos
+        # originales del snapshot. Se inicializan todos como "pendiente" antes de añadir el nuevo.
+        _pe_raw = [
+            {
+                "id_punto_control": p["id_punto_control"],
+                "orden": int(p.get("orden", 0)),
+                "estado": "pendiente",
+                "fecha_hora_paso": None,
+                "id_lectura": None,
+                "id_movimiento": None,
+            }
+            for p in puntos_snapshot
+        ]
+    puntos_estado: list[dict] = _pe_raw
+
+    # El punto no debe estar ya en el snapshot
+    ids_en_snapshot = {p["id_punto_control"] for p in puntos_snapshot}
+    if payload.id_punto_control in ids_en_snapshot:
+        raise HTTPException(status_code=409, detail="El punto de control ya existe en este recorrido")
+
+    # Calcular el máximo orden de puntos ya interactuados
+    interacted_ordenes = [
+        int(p.get("orden", 0))
+        for p in puntos_estado
+        if p.get("estado") in _estados_interactuados()
+    ]
+    max_interacted_orden = max(interacted_ordenes, default=0)
+    max_snapshot_orden = max((int(p.get("orden", 0)) for p in puntos_snapshot), default=0)
+
+    if payload.orden is not None:
+        if payload.orden <= max_interacted_orden:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"El orden {payload.orden} es anterior o igual al último punto ejecutado "
+                    f"(orden {max_interacted_orden}). Solo se pueden insertar puntos futuros."
+                ),
+            )
+        orden = payload.orden
+    else:
+        orden = max_snapshot_orden + 1
+
+    nuevo_snap = {"id_punto_control": payload.id_punto_control, "orden": orden}
+    nuevo_estado_item = {
+        "id_punto_control": payload.id_punto_control,
+        "orden": orden,
+        "estado": "pendiente",
+        "fecha_hora_paso": None,
+        "id_lectura": None,
+        "id_movimiento": None,
+    }
+
+    nuevo_snapshot = sorted(puntos_snapshot + [nuevo_snap], key=lambda x: int(x.get("orden", 0)))
+    nuevo_estado_lista = sorted(puntos_estado + [nuevo_estado_item], key=lambda x: int(x.get("orden", 0)))
+
+    now = datetime.now(timezone.utc).isoformat()
+    doc_ref.update({
+        "puntos_snapshot": nuevo_snapshot,
+        "puntos_estado": nuevo_estado_lista,
+        "updated_at": now,
+    })
+
+    nombre_punto = punto_snap.to_dict().get("nombre", payload.id_punto_control)
+    return {
+        "status": "ok",
+        "punto_agregado": {**nuevo_snap, "nombre": nombre_punto},
+        "total_puntos": len(nuevo_snapshot),
+    }
+
+
+@router.post("/seguimiento-rutas/asignaciones/{id_asignacion_ruta}/recargar-ruta")
+def recargar_ruta_recorrido(
+    id_asignacion_ruta: str,
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Sincroniza los puntos futuros no interactuados del recorrido con la ruta maestra actual.
+
+    Algoritmo de recarga segura:
+    1. Puntos interactuados (pasado/omitido) → inmutables, nunca se tocan.
+    2. Identificar puntos futuros en el snapshot actual y en la nueva ruta.
+    3. Si hay puntos futuros que serían ELIMINADOS o que cambiarían de ORDEN RELATIVO → AMBIGUO.
+    4. Si solo hay adiciones puras (nuevos puntos en ruta no presentes en snapshot) → SEGURO.
+    5. En caso ambiguo: retornar descripción del conflicto sin modificar nada.
+    """
+    db = get_firestore_client()
+    doc_ref = db.collection("ruta_camion_asignacion").document(id_asignacion_ruta)
+    snap = doc_ref.get()
+    if not snap.exists:
+        raise HTTPException(status_code=404, detail="Recorrido no encontrado")
+    recorrido = snap.to_dict()
+
+    estado = recorrido.get("estado_recorrido")
+    if estado not in ("en_proceso", "agendado"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"La recarga de ruta solo está disponible para recorridos 'en_proceso' o 'agendado'.",
+        )
+
+    id_ruta = recorrido.get("id_ruta")
+    ruta_snap = db.collection("ruta").document(id_ruta).get()
+    if not ruta_snap.exists:
+        raise HTTPException(status_code=404, detail="Ruta maestra no encontrada")
+
+    ruta_puntos_nuevos = sorted(ruta_snap.to_dict().get("puntos", []), key=lambda x: int(x.get("orden", 0)))
+
+    puntos_snapshot: list[dict] = sorted(
+        recorrido.get("puntos_snapshot") or [],
+        key=lambda x: int(x.get("orden", 0)),
+    )
+    puntos_estado: list[dict] = recorrido.get("puntos_estado") or []
+
+    # Conjuntos de IDs
+    interacted_ids = {
+        p["id_punto_control"]
+        for p in puntos_estado
+        if p.get("estado") in _estados_interactuados()
+    }
+    snapshot_ids = {p["id_punto_control"] for p in puntos_snapshot}
+
+    # Puntos futuros del snapshot (pendientes)
+    future_snapshot = [p for p in puntos_snapshot if p["id_punto_control"] not in interacted_ids]
+    future_ids = {p["id_punto_control"] for p in future_snapshot}
+
+    nueva_ruta_ids = {p["id_punto_control"] for p in ruta_puntos_nuevos}
+
+    # Puntos completamente nuevos (en nueva ruta, NOT en snapshot completo)
+    puntos_solo_nuevos = [p for p in ruta_puntos_nuevos if p["id_punto_control"] not in snapshot_ids]
+
+    # Futuros que serían eliminados
+    futuros_eliminados = [p for p in future_snapshot if p["id_punto_control"] not in nueva_ruta_ids]
+
+    # Verificar si el orden relativo de los futuros comunes cambiaría
+    common_order_snapshot = [p["id_punto_control"] for p in future_snapshot if p["id_punto_control"] in nueva_ruta_ids]
+    common_order_nueva = [p["id_punto_control"] for p in ruta_puntos_nuevos if p["id_punto_control"] in future_ids]
+    orden_relativo_cambio = common_order_snapshot != common_order_nueva
+
+    # ── Detectar ambigüedad ──────────────────────────────────────────
+    if futuros_eliminados or orden_relativo_cambio:
+        motivos = []
+        if futuros_eliminados:
+            ids_elim = [p["id_punto_control"] for p in futuros_eliminados]
+            motivos.append(
+                f"{len(futuros_eliminados)} punto(s) futuro(s) serían eliminados del recorrido: {ids_elim}"
+            )
+        if orden_relativo_cambio:
+            motivos.append(
+                "El orden relativo de los puntos futuros existentes cambiaría, "
+                "lo que no puede reinterpretarse de forma segura automáticamente."
+            )
+        return {
+            "status": "ok",
+            "resultado": "ambiguo",
+            "mensaje": (
+                "La recarga no es segura: los cambios en la ruta afectan puntos futuros "
+                "ya registrados en el recorrido. Usa 'Añadir punto adicional' para incorporar "
+                "nuevos puntos manualmente sin riesgo de alterar el historial."
+            ),
+            "motivos": motivos,
+            "puntos_agregados": [],
+        }
+
+    # ── Sin cambios ──────────────────────────────────────────────────
+    if not puntos_solo_nuevos:
+        return {
+            "status": "ok",
+            "resultado": "sin_cambios",
+            "mensaje": "La ruta maestra no tiene puntos nuevos respecto al recorrido actual. No hay nada que sincronizar.",
+            "puntos_agregados": [],
+        }
+
+    # ── Adición pura — seguro ────────────────────────────────────────
+    max_orden_actual = max((int(p.get("orden", 0)) for p in puntos_snapshot), default=0)
+    nuevos_con_orden: list[dict] = []
+    for i, p in enumerate(puntos_solo_nuevos):
+        nuevos_con_orden.append({
+            "id_punto_control": p["id_punto_control"],
+            "orden": max_orden_actual + i + 1,
+        })
+
+    nuevo_snapshot = sorted(
+        puntos_snapshot + nuevos_con_orden,
+        key=lambda x: int(x.get("orden", 0)),
+    )
+    nuevos_estado_items = [
+        {
+            "id_punto_control": p["id_punto_control"],
+            "orden": p["orden"],
+            "estado": "pendiente",
+            "fecha_hora_paso": None,
+            "id_lectura": None,
+            "id_movimiento": None,
+        }
+        for p in nuevos_con_orden
+    ]
+    nuevo_estado_completo = sorted(
+        puntos_estado + nuevos_estado_items,
+        key=lambda x: int(x.get("orden", 0)),
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+    doc_ref.update({
+        "puntos_snapshot": nuevo_snapshot,
+        "puntos_estado": nuevo_estado_completo,
+        "updated_at": now,
+    })
+
+    return {
+        "status": "ok",
+        "resultado": "ok",
+        "mensaje": f"Se agregaron {len(nuevos_con_orden)} punto(s) nuevo(s) al recorrido.",
+        "puntos_agregados": nuevos_con_orden,
+    }
 
 
 @router.get("/seguimiento-rutas/asignaciones")
@@ -889,7 +1334,6 @@ def list_ruta_asignaciones(id_ruta: str | None = None, user: dict = Depends(get_
     for item in items:
         camion = camiones.get(item.get("id_camion"), {})
         item["patente"] = camion.get("patente")
-        # Enriquecer con conductor asignado al camión al momento del recorrido
         id_conductor = camion.get("id_conductor")
         conductor = conductores.get(id_conductor, {}) if id_conductor else {}
         item["conductor_nombre"] = (
@@ -897,6 +1341,12 @@ def list_ruta_asignaciones(id_ruta: str | None = None, user: dict = Depends(get_
             if conductor else None
         )
         item["id_conductor"] = id_conductor
+        # Normalizar estado_recorrido para registros legacy sin campo explícito.
+        # Garantiza que el frontend siempre recibe un valor canónico.
+        if not item.get("estado_recorrido"):
+            item["estado_recorrido"] = (
+                "finalizado" if not item.get("activa") else "en_proceso"
+            )
     return {"status": "ok", "data": items}
 
 
@@ -934,70 +1384,106 @@ def get_seguimiento_ruta(
         if asignacion is None:
             raise HTTPException(status_code=404, detail="Recorrido no encontrado")
     else:
-        asignacion = next((item for item in asignaciones if item.get("activa")), asignaciones[0])
+        # Prioridad: en_proceso > agendado > más reciente (para lectura histórica)
+        asignacion = (
+            next((a for a in asignaciones if a.get("estado_recorrido") == "en_proceso"), None)
+            or next((a for a in asignaciones if a.get("estado_recorrido") == "agendado"), None)
+            or next((a for a in asignaciones if a.get("activa")), None)  # legacy
+            or asignaciones[0]
+        )
 
-    # Usar el snapshot de puntos guardado al crear el recorrido (req: cambios en la ruta
-    # no afectan recorridos ya registrados). Si no existe snapshot (recorridos antiguos),
-    # se cae de respaldo a los puntos actuales de la ruta.
+    # Usar el snapshot de puntos guardado al crear el recorrido.
+    # Garantiza que editar la ruta maestra no altera recorridos ya registrados.
     puntos_ruta = sorted(
         asignacion.get("puntos_snapshot") or ruta_snap.to_dict().get("puntos", []),
-        key=lambda x: x.get("orden", 0),
+        key=lambda x: int(x.get("orden", 0)),
     )
 
     hora_inicio = _parse_iso_datetime(asignacion.get("hora_inicio"))
     if hora_inicio is None:
         return {"status": "ok", "data": {"id_ruta": id_ruta, "id_camion": id_camion, "puntos": []}}
     hora_fin = _parse_iso_datetime(asignacion.get("fecha_fin"))
-    movimientos_por_camion = _load_movimientos_por_camion(db)
-    movs_camion = _filter_movimientos_en_ventana(
-        movimientos_por_camion.get(id_camion, []),
-        hora_inicio,
-        hora_fin,
-    )
-    pass_map: dict[str, datetime] = {}
-    for mov in movs_camion:
-        pid = mov.get("id_punto_control")
-        if pid and pid not in pass_map:
-            pass_map[pid] = mov["_dt"]
-    ordenes_pasadas = []
-    for p in puntos_ruta:
-        pid = p.get("id_punto_control")
-        if pid in pass_map:
-            ordenes_pasadas.append(int(p.get("orden", 0)))
-    started = len(ordenes_pasadas) > 0
-    max_orden_pasada = max(ordenes_pasadas) if ordenes_pasadas else 0
     now = datetime.now(timezone.utc)
-    salida = []
-    for p in puntos_ruta:
-        pid = p.get("id_punto_control")
-        orden = int(p.get("orden", 0))
-        punto = puntos_lookup.get(pid, {})
-        marca = pass_map.get(pid)
-        if marca:
-            estado = "pasado"
-            fecha_hora = marca.isoformat()
-            tiempo_en_punto = None
-        else:
-            if started and orden < max_orden_pasada:
-                estado = "omitido"
-            else:
-                estado = "pendiente"
-            fecha_hora = None
-            tiempo_en_punto = None
-        salida.append(
-            {
-                "id_punto_control": pid,
-                "nombre_punto": punto.get("nombre"),
-                "orden": orden,
-                "estado": estado,
-                "fecha_hora_paso": fecha_hora,
-                "tiempo_en_punto": tiempo_en_punto,
-                "referencia_tiempo_en_punto": None,
-            }
+
+    # ----------------------------------------------------------------
+    # Fuente de estados: puntos_estado persistido (write-time)
+    # Fallback: movimientos filtrados por ventana (legacy / compatibilidad)
+    # ----------------------------------------------------------------
+    puntos_estado_persistido: list[dict] = asignacion.get("puntos_estado") or []
+
+    if puntos_estado_persistido:
+        # Ruta nueva: leer del estado persistido en escritura
+        estado_por_punto = {
+            p["id_punto_control"]: p for p in puntos_estado_persistido
+        }
+        salida = []
+        for p in puntos_ruta:
+            pid = p.get("id_punto_control")
+            orden = int(p.get("orden", 0))
+            punto = puntos_lookup.get(pid, {})
+            ep = estado_por_punto.get(pid, {})
+            estado = ep.get("estado", "pendiente")
+            fecha_hora = ep.get("fecha_hora_paso")
+            salida.append(
+                {
+                    "id_punto_control": pid,
+                    "nombre_punto": punto.get("nombre"),
+                    "orden": orden,
+                    "estado": estado,
+                    "fecha_hora_paso": fecha_hora,
+                    "tiempo_en_punto": None,
+                    "referencia_tiempo_en_punto": None,
+                    "id_movimiento": ep.get("id_movimiento"),
+                }
+            )
+    else:
+        # Fallback legacy: calcular desde movimientos por ventana de tiempo
+        movimientos_por_camion = _load_movimientos_por_camion(db)
+        movs_camion = _filter_movimientos_en_ventana(
+            movimientos_por_camion.get(id_camion, []),
+            hora_inicio,
+            hora_fin,
         )
+        pass_map: dict[str, datetime] = {}
+        for mov in movs_camion:
+            pid = mov.get("id_punto_control")
+            if pid and pid not in pass_map:
+                pass_map[pid] = mov["_dt"]
+        ordenes_pasadas = [
+            int(p.get("orden", 0))
+            for p in puntos_ruta
+            if p.get("id_punto_control") in pass_map
+        ]
+        started = len(ordenes_pasadas) > 0
+        max_orden_pasada = max(ordenes_pasadas) if ordenes_pasadas else 0
+        salida = []
+        for p in puntos_ruta:
+            pid = p.get("id_punto_control")
+            orden = int(p.get("orden", 0))
+            punto = puntos_lookup.get(pid, {})
+            marca = pass_map.get(pid)
+            if marca:
+                estado = "pasado"
+                fecha_hora = marca.isoformat()
+            else:
+                estado = "omitido" if (started and orden < max_orden_pasada) else "pendiente"
+                fecha_hora = None
+            salida.append(
+                {
+                    "id_punto_control": pid,
+                    "nombre_punto": punto.get("nombre"),
+                    "orden": orden,
+                    "estado": estado,
+                    "fecha_hora_paso": fecha_hora,
+                    "tiempo_en_punto": None,
+                    "referencia_tiempo_en_punto": None,
+                    "id_movimiento": None,
+                }
+            )
+
     salida.sort(key=lambda x: x["orden"])
 
-    # Detectar si aún hay puntos pendientes para la lógica de "en_punto"
+    # Lógica de "en_punto": el primer pendiente después de un punto pasado
     if salida:
         pendientes = [item for item in salida if item["estado"] == "pendiente"]
         if pendientes:
@@ -1010,28 +1496,36 @@ def get_seguimiento_ruta(
                     actual["estado"] = "en_punto"
                     elapsed = now - previo_dt
                     minutes = int(elapsed.total_seconds() // 60)
-                    hours = minutes // 60
-                    mins = minutes % 60
-                    actual["tiempo_en_punto"] = f"{hours:02d}:{mins:02d}"
+                    actual["tiempo_en_punto"] = f"{minutes // 60:02d}:{minutes % 60:02d}"
                     actual["referencia_tiempo_en_punto"] = previo_dt.isoformat()
 
-    # Auto-completar el recorrido cuando todos los puntos fueron visitados
+    # Auto-completar solo para rutas legacy (sin puntos_estado): las nuevas
+    # se completan en escritura dentro de _register_movimiento_desde_lectura.
     auto_completado = False
-    todos_pasados = salida and all(p["estado"] in ("pasado", "omitido") for p in salida)
-    if todos_pasados and asignacion.get("activa"):
-        ultimo_paso = max(
-            (_parse_iso_datetime(p["fecha_hora_paso"]) for p in salida if p.get("fecha_hora_paso")),
-            default=now,
-        )
-        db.collection("ruta_camion_asignacion").document(
-            asignacion["id_asignacion_ruta"]
-        ).update({
-            "activa": False,
-            "fecha_fin": ultimo_paso.isoformat(),
-            "updated_at": now.isoformat(),
-        })
-        hora_fin = ultimo_paso
-        auto_completado = True
+    if not puntos_estado_persistido:
+        todos_pasados = salida and all(p["estado"] in ("pasado", "omitido") for p in salida)
+        if todos_pasados and asignacion.get("activa"):
+            ultimo_paso = max(
+                (_parse_iso_datetime(p["fecha_hora_paso"]) for p in salida if p.get("fecha_hora_paso")),
+                default=now,
+            )
+            db.collection("ruta_camion_asignacion").document(
+                asignacion["id_asignacion_ruta"]
+            ).update({
+                "estado_recorrido": "finalizado",
+                "activa": False,
+                "fecha_fin": ultimo_paso.isoformat(),
+                "updated_at": now.isoformat(),
+            })
+            hora_fin = ultimo_paso
+            auto_completado = True
+
+    # Inferir estado_recorrido para registros legacy sin campo explícito
+    estado_recorrido = asignacion.get("estado_recorrido") or (
+        "finalizado" if not asignacion.get("activa") else "en_proceso"
+    )
+    if auto_completado:
+        estado_recorrido = "finalizado"
 
     return {
         "status": "ok",
@@ -1041,7 +1535,8 @@ def get_seguimiento_ruta(
             "id_asignacion_ruta": asignacion.get("id_asignacion_ruta"),
             "hora_inicio": hora_inicio.isoformat(),
             "fecha_fin": hora_fin.isoformat() if hora_fin else None,
-            "activa": False if auto_completado else asignacion.get("activa", False),
+            "estado_recorrido": estado_recorrido,
+            "activa": asignacion.get("activa", False) and not auto_completado,
             "auto_completado": auto_completado,
             "puntos": salida,
         },
@@ -1328,8 +1823,6 @@ def dashboard_ubicacion_tiempo_real(user: dict = Depends(get_current_user)) -> d
         for visita in visita_activa_por_camion.values()
         if visita.get("id_visita")
     }
-    if not visitas_por_id:
-        return {"status": "ok", "data": []}
 
     puntos = {
         doc.to_dict().get("id_punto_control"): doc.to_dict()
@@ -1338,35 +1831,57 @@ def dashboard_ubicacion_tiempo_real(user: dict = Depends(get_current_user)) -> d
     camiones = _load_camiones(db)
     conductores = _load_conductores(db)
 
+    # Recorre todos los movimientos y mantiene el más reciente por camión.
+    # Acepta dos fuentes de identidad del camión:
+    #   a) id_visita → visita activa → id_camion  (módulo de planta)
+    #   b) id_camion directo en el movimiento      (módulo de rutas, id_visita=null)
     ultimos_movimientos: dict[str, dict] = {}
     for doc in db.collection("movimiento_acceso").stream():
         movimiento = doc.to_dict()
-        visita = visitas_por_id.get(movimiento.get("id_visita"))
-        if not visita:
-            continue
-        id_camion = visita.get("id_camion")
         timestamp = _parse_iso_datetime(movimiento.get("fecha_hora_movimiento"))
-        if not id_camion or timestamp is None:
+        if timestamp is None:
             continue
+
+        # Fuente a: visita de planta activa
+        id_camion = None
+        id_conductor_mov = None
+        visita = visitas_por_id.get(movimiento.get("id_visita"))
+        if visita:
+            id_camion = visita.get("id_camion")
+            id_conductor_mov = visita.get("id_conductor")
+
+        # Fuente b: campos directos en el movimiento (rutas sin visita de planta)
+        if not id_camion:
+            id_camion = movimiento.get("id_camion")
+            id_conductor_mov = movimiento.get("id_conductor")
+
+        if not id_camion:
+            continue
+
         actual = ultimos_movimientos.get(id_camion)
         if actual is None or timestamp > actual["_dt"]:
-            ultimos_movimientos[id_camion] = {**movimiento, "_dt": timestamp, "_visita": visita}
+            ultimos_movimientos[id_camion] = {
+                **movimiento,
+                "_dt": timestamp,
+                "_id_conductor": id_conductor_mov,
+            }
 
     markers = []
     for id_camion, movimiento in ultimos_movimientos.items():
-        visita = movimiento["_visita"]
         punto = puntos.get(movimiento.get("id_punto_control"), {})
-        coords = _parse_coords(punto.get("cordenadas"))
+        # Prioridad coordenadas: campo directo en movimiento → campo en punto_control
+        coords = _parse_coords(movimiento.get("cordenadas")) or _parse_coords(punto.get("cordenadas"))
         if coords is None:
             continue
         camion = camiones.get(id_camion, {})
-        conductor = conductores.get(visita.get("id_conductor"), {})
+        id_conductor = movimiento.get("_id_conductor")
+        conductor = conductores.get(id_conductor, {}) if id_conductor else {}
         nombre_conductor = f"{conductor.get('nombre', '')} {conductor.get('apellido', '')}".strip() or "-"
         markers.append(
             {
                 "id_camion": id_camion,
                 "patente": camion.get("patente") or id_camion,
-                "id_conductor": visita.get("id_conductor"),
+                "id_conductor": id_conductor,
                 "conductor": nombre_conductor,
                 "id_punto_control": movimiento.get("id_punto_control"),
                 "punto_control": punto.get("nombre") or movimiento.get("id_punto_control"),
@@ -1469,8 +1984,12 @@ def dashboard_movimientos(user: dict = Depends(get_current_user)) -> list[Dashbo
             continue
         mov_dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         visita = visitas.get(mov.get("id_visita"), {})
-        camion = camiones.get(visita.get("id_camion"), {})
-        conductor = conductores.get(visita.get("id_conductor"), {})
+        # Fallback para movimientos de ruta sin visita de planta (id_visita=null):
+        # usar id_camion e id_conductor almacenados directamente en el movimiento.
+        id_camion_mov = visita.get("id_camion") or mov.get("id_camion")
+        id_conductor_mov = visita.get("id_conductor") or mov.get("id_conductor")
+        camion = camiones.get(id_camion_mov, {})
+        conductor = conductores.get(id_conductor_mov, {})
         punto = puntos.get(mov.get("id_punto_control"), {})
         result.append(
             DashboardMovimiento(

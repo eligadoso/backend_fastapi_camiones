@@ -66,3 +66,18 @@ async def startup_event() -> None:
     ensure_admin_user()
     if settings.thingspeak_poll_enabled:
         asyncio.create_task(thingspeak_poll_loop())
+
+
+def run() -> None:
+    import uvicorn
+
+    uvicorn.run(
+        "app.main:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=settings.app_env.lower() == "development",
+    )
+
+
+if __name__ == "__main__":
+    run()

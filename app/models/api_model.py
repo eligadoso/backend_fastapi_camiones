@@ -129,6 +129,11 @@ class RutaCamionAsignacionCreate(BaseModel):
     hora_inicio: datetime
 
 
+class AgregarPuntoRecorridoPayload(BaseModel):
+    id_punto_control: str
+    orden: int | None = None  # None → append al final del snapshot
+
+
 class DashboardSummary(BaseModel):
     camiones_en_planta: int
     ingresos_hoy: int
